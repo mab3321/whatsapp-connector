@@ -1,9 +1,26 @@
 package livekitbridge
 
 import (
-	"github.com/pion/rtp"
 	"testing"
+
+	lksdk "github.com/livekit/server-sdk-go/v2"
+	"github.com/pion/rtp"
 )
+
+func TestEndsCallWhenAgentDeparts(t *testing.T) {
+	if !endsCallOnDeparture(lksdk.ParticipantAgent) {
+		t.Fatal("agent departure must end the WhatsApp call")
+	}
+	for _, kind := range []lksdk.ParticipantKind{
+		lksdk.ParticipantStandard,
+		lksdk.ParticipantSIP,
+		lksdk.ParticipantConnector,
+	} {
+		if endsCallOnDeparture(kind) {
+			t.Fatalf("participant kind %v must not end the WhatsApp call", kind)
+		}
+	}
+}
 
 func TestRTPTranslatorMaintainsContinuity(t *testing.T) {
 	var tr rtpTranslator

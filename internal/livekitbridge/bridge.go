@@ -46,6 +46,16 @@ func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error
 				go conf.OnDisconnected()
 			}
 		},
+		OnParticipantDisconnected: func(participant *lksdk.RemoteParticipant) {
+			if !endsCallOnDeparture(participant.Kind()) {
+				return
+			}
+			b.log.Info("agent participant disconnected", "participant", participant.Identity())
+			b.closeDone()
+			if conf.OnDisconnected != nil {
+				go conf.OnDisconnected()
+			}
+		},
 		ParticipantCallback: lksdk.ParticipantCallback{
 			OnTrackPublished: func(pub *lksdk.RemoteTrackPublication, _ *lksdk.RemoteParticipant) {
 				if pub.Kind() == lksdk.TrackKindAudio {
@@ -91,6 +101,10 @@ func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error
 	}
 	b.local = track
 	return b, nil
+}
+
+func endsCallOnDeparture(kind lksdk.ParticipantKind) bool {
+	return kind == lksdk.ParticipantAgent
 }
 
 func (b *Bridge) WriteFromMeta(p *rtp.Packet) error {
