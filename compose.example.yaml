@@ -1,0 +1,7 @@
+services:
+  whatsapp-connector:
+    image: muhammadab3321/whatsapp-connector:REPLACE_WITH_GIT_SHA
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .whatsapp-connector.env

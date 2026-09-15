@@ -1,0 +1,6 @@
+.env
+*.pem
+*.key
+bin/
+dist/
+
