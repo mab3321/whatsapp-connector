@@ -53,3 +53,26 @@ func TestRejectsNonOpusAndMissingFingerprint(t *testing.T) {
 		})
 	}
 }
+
+func TestOutboundOfferAndAnswer(t *testing.T) {
+	cert, err := NewCertificate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := NewOffer(cert, netip.MustParseAddr("203.0.113.20"), 40002)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"m=audio 40002 UDP/TLS/RTP/SAVPF 111", "a=setup:actpass", "a=candidate:1 1 udp", "a=ice-ufrag:" + n.LocalUfrag} {
+		if !strings.Contains(n.Answer, want) {
+			t.Errorf("offer missing %q", want)
+		}
+	}
+	answer := strings.Replace(testOffer, "a=setup:actpass", "a=setup:active", 1)
+	if err = ApplyAnswer(answer, n); err != nil {
+		t.Fatal(err)
+	}
+	if n.LocalSetup != "passive" || n.IsClient || len(n.RemoteCandidates) != 2 || n.PayloadType != 111 {
+		t.Fatalf("bad outbound negotiation: %#v", n)
+	}
+}

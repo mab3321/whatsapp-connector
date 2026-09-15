@@ -1,7 +1,7 @@
 # WhatsApp Connector
 
 Self-hosted implementation of LiveKit's livekit.Connector Twirp service for
-inbound WhatsApp Business Calling.
+inbound and outbound WhatsApp Business Calling.
 
 The service accepts the same AcceptWhatsAppCallRequest used by LiveKit SDKs,
 negotiates Meta ICE/DTLS-SRTP, and relays Opus RTP directly to and from a
@@ -10,10 +10,16 @@ self-hosted LiveKit room. It does not transcode audio.
 ## Implemented RPCs
 
 - AcceptWhatsAppCall
+- DialWhatsAppCall
+- ConnectWhatsAppCall
 - DisconnectWhatsAppCall
 
-Outbound WhatsApp and Twilio RPCs return the standard Twirp unimplemented
-error so they can be added without changing the public service contract.
+Twilio RPCs return the standard Twirp unimplemented error.
+
+For outbound calls, call `DialWhatsAppCall` first. When Meta sends the
+`BUSINESS_INITIATED` connect webhook containing its SDP answer, forward it to
+`ConnectWhatsAppCall`. The destination must have granted WhatsApp call
+permission to the business; Meta rejects calls without that permission.
 
 ## Configuration
 

@@ -45,3 +45,23 @@ func TestCallActions(t *testing.T) {
 		}
 	}
 }
+
+func TestDial(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b callRequest
+		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+			t.Fatal(err)
+		}
+		if b.Action != "connect" || b.To != "923094836196" || b.CallID != "" || b.Session == nil || b.Session.SDPType != "offer" || b.Opaque != "trace" {
+			t.Fatalf("bad dial request: %#v", b)
+		}
+		_, _ = w.Write([]byte(`{"messaging_product":"whatsapp","calls":[{"id":"wacid.test"}]}`))
+	}))
+	defer s.Close()
+	c := New()
+	c.BaseURL = s.URL
+	id, err := c.Dial(context.Background(), "26.0", "phone", "secret", "+923094836196", "trace", "v=0")
+	if err != nil || id != "wacid.test" {
+		t.Fatalf("id=%q err=%v", id, err)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -16,6 +17,7 @@ import (
 	"github.com/mab3321/whatsapp-connector/internal/livekitbridge"
 	"github.com/mab3321/whatsapp-connector/internal/media"
 	"github.com/mab3321/whatsapp-connector/internal/meta"
+	"github.com/pion/rtp"
 )
 
 type Config struct {
@@ -32,6 +34,14 @@ type AcceptParams struct {
 	Agents                                     []*livekit.RoomAgentDispatch
 	Wait                                       bool
 	Timeout                                    time.Duration
+}
+
+type DialParams struct {
+	PhoneID, APIToken, APIVersion, To, Opaque string
+	RoomName, Identity, Name, Metadata        string
+	Attributes                                map[string]string
+	Agents                                    []*livekit.RoomAgentDispatch
+	Timeout                                   time.Duration
 }
 
 type Manager struct {
@@ -54,7 +64,11 @@ type Call struct {
 	transport                           *media.Transport
 	bridge                              *livekitbridge.Bridge
 	answer                              string
-	ready, done                         chan struct{}
+	ready, answerReady, done            chan struct{}
+	udp                                 *net.UDPConn
+	cert                                *media.Certificate
+	negotiation                         *media.Negotiation
+	outbound                            bool
 	mu                                  sync.Mutex
 	err                                 error
 	terminate, userTerminated, signaled bool
@@ -126,7 +140,7 @@ func (m *Manager) Accept(ctx context.Context, p AcceptParams) (string, error) {
 	m.calls[p.CallID] = c
 	m.wg.Add(1)
 	m.mu.Unlock()
-	go m.run(c, n.PayloadType)
+	go m.runInbound(c, n.PayloadType)
 	if p.Wait {
 		err := c.wait(ctx)
 		if err != nil {
@@ -137,21 +151,99 @@ func (m *Manager) Accept(ctx context.Context, p AcceptParams) (string, error) {
 	return c.room, nil
 }
 
-func (m *Manager) run(c *Call, payload uint8) {
-	defer func() {
-		c.cleanup(m.meta)
-		m.mu.Lock()
-		delete(m.calls, c.params.CallID)
+func (m *Manager) Dial(ctx context.Context, p DialParams) (string, string, error) {
+	if p.PhoneID == "" || p.APIToken == "" || p.APIVersion == "" || p.To == "" {
+		return "", "", errors.New("required outbound WhatsApp call fields are missing")
+	}
+	m.mu.Lock()
+	if m.draining {
 		m.mu.Unlock()
-		m.wg.Done()
-		close(c.done)
+		return "", "", errors.New("connector is draining")
+	}
+	m.mu.Unlock()
+	if p.RoomName == "" {
+		p.RoomName = "whatsapp-" + uuid.NewString()
+	}
+	if p.Identity == "" {
+		p.Identity = "whatsapp-" + uuid.NewString()
+	}
+	udp, err := m.ports.Listen()
+	if err != nil {
+		return "", "", err
+	}
+	cert, err := media.NewCertificate()
+	if err != nil {
+		_ = udp.Close()
+		return "", "", err
+	}
+	n, err := media.NewOffer(cert, m.conf.PublicIP, udp.LocalAddr().(*net.UDPAddr).Port)
+	if err != nil {
+		_ = udp.Close()
+		return "", "", err
+	}
+	callID, err := m.meta.Dial(ctx, p.APIVersion, p.PhoneID, p.APIToken, p.To, p.Opaque, n.Answer)
+	if err != nil {
+		_ = udp.Close()
+		return "", "", err
+	}
+	ap := AcceptParams{PhoneID: p.PhoneID, APIToken: p.APIToken, APIVersion: p.APIVersion, CallID: callID,
+		RoomName: p.RoomName, Identity: p.Identity, Name: p.Name, Metadata: p.Metadata,
+		Attributes: p.Attributes, Agents: p.Agents, Timeout: p.Timeout}
+	callCtx, cancel := context.WithCancel(context.Background())
+	c := &Call{log: m.log.With("call", callLabel(callID), "room", p.RoomName), params: ap,
+		room: p.RoomName, identity: p.Identity, ctx: callCtx, cancel: cancel, udp: udp, cert: cert,
+		negotiation: n, outbound: true, signaled: true, ready: make(chan struct{}), answerReady: make(chan struct{}), done: make(chan struct{})}
+	m.mu.Lock()
+	if m.draining {
+		m.mu.Unlock()
+		c.stopBusiness()
+		c.cleanup(m.meta)
+		return "", "", errors.New("connector is draining")
+	}
+	m.calls[callID] = c
+	m.wg.Add(1)
+	m.mu.Unlock()
+	go m.runOutbound(c)
+	return callID, p.RoomName, nil
+}
+
+func (m *Manager) Connect(ctx context.Context, callID, answer string, wait bool) error {
+	m.mu.Lock()
+	c := m.calls[callID]
+	m.mu.Unlock()
+	if c == nil || !c.outbound {
+		return errors.New("outbound WhatsApp call not found")
+	}
+	c.mu.Lock()
+	if c.transport == nil {
+		if err := media.ApplyAnswer(answer, c.negotiation); err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		c.transport = media.NewTransport(c.ctx, c.udp, c.negotiation, m.conf.SetupTimeout)
+		close(c.answerReady)
+	}
+	c.mu.Unlock()
+	if wait {
+		return c.wait(ctx)
+	}
+	return nil
+}
+
+func (m *Manager) finish(c *Call) {
+	c.cleanup(m.meta)
+	m.mu.Lock()
+	delete(m.calls, c.params.CallID)
+	m.mu.Unlock()
+	m.wg.Done()
+	close(c.done)
+}
+
+func (m *Manager) runInbound(c *Call, payload uint8) {
+	defer func() {
+		m.finish(c)
 	}()
-	b, err := livekitbridge.Connect(c.ctx, c.log, livekitbridge.Config{
-		URL: m.conf.LiveKitURL, APIKey: m.conf.APIKey, APISecret: m.conf.APISecret,
-		RoomName: c.room, Identity: c.identity, Name: c.params.Name, Metadata: c.params.Metadata,
-		Attributes: c.params.Attributes, Agents: c.params.Agents, PayloadType: payload,
-		WriteToMeta: c.transport.WriteRTP, OnDisconnected: c.stopBusiness,
-	})
+	b, err := m.connectBridge(c, payload)
 	if err != nil {
 		c.fail(err)
 		return
@@ -173,6 +265,56 @@ func (m *Manager) run(c *Call, payload uint8) {
 		c.fail(err)
 		return
 	}
+	c.connected(b)
+}
+
+func (m *Manager) connectBridge(c *Call, payload uint8) (*livekitbridge.Bridge, error) {
+	return livekitbridge.Connect(c.ctx, c.log, livekitbridge.Config{
+		URL: m.conf.LiveKitURL, APIKey: m.conf.APIKey, APISecret: m.conf.APISecret,
+		RoomName: c.room, Identity: c.identity, Name: c.params.Name, Metadata: c.params.Metadata,
+		Attributes: c.params.Attributes, Agents: c.params.Agents, PayloadType: payload,
+		WriteToMeta: c.writeToMeta, OnDisconnected: c.stopBusiness,
+	})
+}
+
+func (m *Manager) runOutbound(c *Call) {
+	defer m.finish(c)
+	b, err := m.connectBridge(c, c.negotiation.PayloadType)
+	if err != nil {
+		c.fail(err)
+		return
+	}
+	c.bridge = b
+	timeout := c.params.Timeout
+	if timeout <= 0 {
+		timeout = m.conf.SetupTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-c.answerReady:
+	case <-timer.C:
+		c.fail(context.DeadlineExceeded)
+		return
+	case <-c.ctx.Done():
+		return
+	}
+	c.mu.Lock()
+	t := c.transport
+	c.mu.Unlock()
+	if t == nil {
+		c.fail(errors.New("outbound transport was not created"))
+		return
+	}
+	t.Start()
+	if err = t.Wait(); err != nil {
+		c.fail(err)
+		return
+	}
+	c.connected(b)
+}
+
+func (c *Call) connected(b *livekitbridge.Bridge) {
 	c.signalReady(nil)
 	c.log.Info("WhatsApp call connected")
 	errCh := make(chan error, 1)
@@ -193,12 +335,29 @@ func (m *Manager) run(c *Call, payload uint8) {
 	case <-c.ctx.Done():
 	case <-b.Done():
 		c.stopBusiness()
-	case err = <-errCh:
-		if err != nil {
-			c.log.Warn("media ended", "error", err)
+	case mediaErr := <-errCh:
+		if mediaErr != nil {
+			c.log.Warn("media ended", "error", mediaErr)
 		}
 		c.stopBusiness()
 	}
+}
+
+func (c *Call) writeToMeta(p *rtp.Packet) error {
+	if c.outbound {
+		select {
+		case <-c.answerReady:
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		}
+	}
+	c.mu.Lock()
+	t := c.transport
+	c.mu.Unlock()
+	if t == nil {
+		return io.ErrClosedPipe
+	}
+	return t.WriteRTP(p)
 }
 
 func (c *Call) signalReady(err error) {
@@ -259,6 +418,8 @@ func (c *Call) cleanup(mc *meta.Client) {
 	}
 	if c.transport != nil {
 		_ = c.transport.Close()
+	} else if c.udp != nil {
+		_ = c.udp.Close()
 	}
 }
 

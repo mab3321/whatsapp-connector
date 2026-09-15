@@ -53,11 +53,38 @@ func (s *Service) DisconnectWhatsAppCall(_ context.Context, req *livekit.Disconn
 	return &livekit.DisconnectWhatsAppCallResponse{}, nil
 }
 
-func (*Service) DialWhatsAppCall(context.Context, *livekit.DialWhatsAppCallRequest) (*livekit.DialWhatsAppCallResponse, error) {
-	return nil, twirp.NewError(twirp.Unimplemented, "outbound WhatsApp calling is not implemented")
+func (s *Service) DialWhatsAppCall(ctx context.Context, req *livekit.DialWhatsAppCallRequest) (*livekit.DialWhatsAppCallResponse, error) {
+	if req == nil || req.WhatsappPhoneNumberId == "" || req.WhatsappToPhoneNumber == "" || req.WhatsappApiKey == "" || req.WhatsappCloudApiVersion == "" {
+		return nil, twirp.InvalidArgumentError("call", "phone number id, destination, API key and API version are required")
+	}
+	timeout := 45 * time.Second
+	if req.RingingTimeout != nil && req.RingingTimeout.AsDuration() > 0 {
+		timeout = req.RingingTimeout.AsDuration()
+	}
+	callID, room, err := s.calls.Dial(ctx, call.DialParams{
+		PhoneID: req.WhatsappPhoneNumberId, APIToken: req.WhatsappApiKey,
+		APIVersion: req.WhatsappCloudApiVersion, To: req.WhatsappToPhoneNumber,
+		Opaque: req.WhatsappBizOpaqueCallbackData, RoomName: req.RoomName,
+		Identity: req.ParticipantIdentity, Name: req.ParticipantName,
+		Metadata: req.ParticipantMetadata, Attributes: req.ParticipantAttributes,
+		Agents: req.Agents, Timeout: timeout,
+	})
+	if err != nil {
+		return nil, twirp.InvalidArgumentError("call", err.Error())
+	}
+	return &livekit.DialWhatsAppCallResponse{WhatsappCallId: callID, RoomName: room}, nil
 }
-func (*Service) ConnectWhatsAppCall(context.Context, *livekit.ConnectWhatsAppCallRequest) (*livekit.ConnectWhatsAppCallResponse, error) {
-	return nil, twirp.NewError(twirp.Unimplemented, "outbound WhatsApp calling is not implemented")
+func (s *Service) ConnectWhatsAppCall(ctx context.Context, req *livekit.ConnectWhatsAppCallRequest) (*livekit.ConnectWhatsAppCallResponse, error) {
+	if req == nil || req.WhatsappCallId == "" || req.Sdp == nil || req.Sdp.Type != "answer" || req.Sdp.Sdp == "" {
+		return nil, twirp.InvalidArgumentError("sdp", "a call id and SDP answer are required")
+	}
+	if err := s.calls.Connect(ctx, req.WhatsappCallId, req.Sdp.Sdp, req.WaitUntilAnswered); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, twirp.NewError(twirp.DeadlineExceeded, "WhatsApp call setup timed out")
+		}
+		return nil, twirp.InvalidArgumentError("call", err.Error())
+	}
+	return &livekit.ConnectWhatsAppCallResponse{}, nil
 }
 func (*Service) ConnectTwilioCall(context.Context, *livekit.ConnectTwilioCallRequest) (*livekit.ConnectTwilioCallResponse, error) {
 	return nil, twirp.NewError(twirp.Unimplemented, "Twilio calling is not implemented")

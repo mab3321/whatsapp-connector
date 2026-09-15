@@ -47,6 +47,109 @@ type Negotiation struct {
 	Answer                                       string
 }
 
+// NewOffer creates the local half of a business-initiated WhatsApp call. The
+// returned negotiation is completed by ApplyAnswer before starting Transport.
+func NewOffer(cert *Certificate, publicIP netip.Addr, port int) (*Negotiation, error) {
+	if cert == nil || !publicIP.Is4() || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("%w: invalid local transport", ErrInvalidSDP)
+	}
+	lu, err := credential(8)
+	if err != nil {
+		return nil, err
+	}
+	lp, err := credential(24)
+	if err != nil {
+		return nil, err
+	}
+	n := &Negotiation{
+		Certificate: cert, LocalUfrag: lu, LocalPwd: lp,
+		Local: netip.AddrPortFrom(publicIP, uint16(port)), PayloadType: 111,
+		LocalSetup: "actpass",
+	}
+	n.Answer = buildOffer(n)
+	return n, nil
+}
+
+// ApplyAnswer validates Meta's answer and adds its transport parameters to an
+// outbound negotiation without replacing the credentials advertised by Offer.
+func ApplyAnswer(raw string, n *Negotiation) error {
+	if n == nil || n.Certificate == nil || n.LocalUfrag == "" || n.LocalPwd == "" {
+		return fmt.Errorf("%w: outbound offer state missing", ErrInvalidSDP)
+	}
+	m, session, err := compatibleAudio(raw)
+	if err != nil {
+		return err
+	}
+	fp, ok := attr(m, "fingerprint")
+	if !ok {
+		fp, ok = sattr(session, "fingerprint")
+	}
+	if !ok {
+		return fmt.Errorf("%w: fingerprint missing", ErrInvalidSDP)
+	}
+	f := strings.Fields(fp)
+	if len(f) != 2 || !strings.EqualFold(f[0], "sha-256") {
+		return fmt.Errorf("%w: SHA-256 fingerprint required", ErrInvalidSDP)
+	}
+	decoded, e := hex.DecodeString(strings.ReplaceAll(f[1], ":", ""))
+	if e != nil || len(decoded) != sha256.Size {
+		return fmt.Errorf("%w: malformed fingerprint", ErrInvalidSDP)
+	}
+	setup, ok := attr(m, "setup")
+	if !ok {
+		setup, ok = sattr(session, "setup")
+	}
+	if !ok {
+		return fmt.Errorf("%w: setup missing", ErrInvalidSDP)
+	}
+	if _, ok = attr(m, "rtcp-mux"); !ok {
+		return fmt.Errorf("%w: rtcp-mux required", ErrInvalidSDP)
+	}
+	ufrag, ok := attr(m, "ice-ufrag")
+	if !ok {
+		ufrag, ok = sattr(session, "ice-ufrag")
+	}
+	pwd, pok := attr(m, "ice-pwd")
+	if !pok {
+		pwd, pok = sattr(session, "ice-pwd")
+	}
+	if !ok || !pok || ufrag == "" || pwd == "" {
+		return fmt.Errorf("%w: ICE credentials missing", ErrInvalidSDP)
+	}
+	pt, err := opusPayload(m)
+	if err != nil {
+		return err
+	}
+	cands, err := remoteCandidates(m)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidSDP, err)
+	}
+	n.RemoteFingerprint, n.RemoteSetup = strings.ToUpper(f[1]), strings.ToLower(setup)
+	n.RemoteUfrag, n.RemotePwd, n.RemoteCandidates, n.PayloadType = ufrag, pwd, cands, pt
+	switch n.RemoteSetup {
+	case "active":
+		n.LocalSetup, n.IsClient = "passive", false
+	case "passive":
+		n.LocalSetup, n.IsClient = "active", true
+	default:
+		return fmt.Errorf("%w: answer setup must be active or passive", ErrInvalidSDP)
+	}
+	return nil
+}
+
+func compatibleAudio(raw string) (*psdp.MediaDescription, *psdp.SessionDescription, error) {
+	var session psdp.SessionDescription
+	if err := session.Unmarshal([]byte(raw)); err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidSDP, err)
+	}
+	for _, m := range session.MediaDescriptions {
+		if m.MediaName.Media == "audio" && strings.EqualFold(strings.Join(m.MediaName.Protos, "/"), "UDP/TLS/RTP/SAVPF") {
+			return m, &session, nil
+		}
+	}
+	return nil, nil, fmt.Errorf("%w: compatible audio media missing", ErrInvalidSDP)
+}
+
 func NewCertificate() (*Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -222,4 +325,10 @@ func buildAnswer(n *Negotiation) string {
 	ip := n.Local.Addr().String()
 	pt := strconv.Itoa(int(n.PayloadType))
 	return fmt.Sprintf("v=0\r\no=- %d 2 IN IP4 %s\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\na=msid-semantic: WMS\r\nm=audio %d UDP/TLS/RTP/SAVPF %s\r\nc=IN IP4 %s\r\na=mid:0\r\na=sendrecv\r\na=rtcp-mux\r\na=rtpmap:%s opus/48000/2\r\na=fmtp:%s minptime=10;useinbandfec=1\r\na=ice-ufrag:%s\r\na=ice-pwd:%s\r\na=candidate:1 1 udp 2130706431 %s %d typ host\r\na=end-of-candidates\r\na=fingerprint:sha-256 %s\r\na=setup:%s\r\n", sid, ip, n.Local.Port(), pt, ip, pt, pt, n.LocalUfrag, n.LocalPwd, ip, n.Local.Port(), n.Certificate.Fingerprint, n.LocalSetup)
+}
+
+func buildOffer(n *Negotiation) string {
+	sid := uint64(time.Now().UnixNano())
+	ip := n.Local.Addr().String()
+	return fmt.Sprintf("v=0\r\no=- %d 2 IN IP4 %s\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\na=msid-semantic: WMS\r\nm=audio %d UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 %s\r\na=mid:0\r\na=sendrecv\r\na=rtcp-mux\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\na=ice-ufrag:%s\r\na=ice-pwd:%s\r\na=candidate:1 1 udp 2130706431 %s %d typ host\r\na=end-of-candidates\r\na=fingerprint:sha-256 %s\r\na=setup:actpass\r\n", sid, ip, n.Local.Port(), ip, n.LocalUfrag, n.LocalPwd, ip, n.Local.Port(), n.Certificate.Fingerprint)
 }
