@@ -86,7 +86,11 @@ func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error
 		return nil, err
 	}
 	room := lksdk.NewRoom(cb)
-	if err = room.JoinWithContextAndToken(ctx, conf.URL, token, lksdk.WithAutoSubscribe(true), lksdk.WithExtraAttributes(conf.Attributes)); err != nil {
+	if err = room.JoinWithContextAndToken(ctx, conf.URL, token,
+		lksdk.WithAutoSubscribe(true),
+		lksdk.WithExtraAttributes(conf.Attributes),
+		lksdk.WithCodecs([]livekit.Codec{{Mime: webrtc.MimeTypeOpus}}),
+	); err != nil {
 		return nil, err
 	}
 	b.room = room
@@ -178,4 +182,10 @@ func (t *rtpTranslator) rewrite(p *rtp.Packet, pt uint8) {
 		t.lastInput = p.Timestamp
 	}
 	p.PayloadType, p.SSRC, p.SequenceNumber, p.Timestamp = pt, t.ssrc, t.seq, t.timestamp
+	// The LiveKit WebRTC hop and Meta transport negotiate extensions
+	// independently. Forwarding LiveKit's extension IDs to Meta violates the
+	// Meta SDP, so emit a plain RTP header on this hop.
+	p.Extension = false
+	p.ExtensionProfile = 0
+	p.Extensions = nil
 }
