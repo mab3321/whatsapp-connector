@@ -122,12 +122,40 @@ func (t *Transport) run() {
 				}
 				if err == nil {
 					sc, err = psrtp.NewSessionSRTCP(mux.srtcp, scfg)
+					if err == nil {
+						// SessionSRTCP blocks its reader when a newly discovered
+						// stream is not accepted. Because RTP and RTCP share the
+						// packet mux, leaving RTCP unread eventually fills the RTCP
+						// endpoint buffer and stalls inbound RTP as well.
+						go drainSRTCP(sc)
+					}
 				}
 			}
 		}
 	}
 	t.setResult(dc, sr, sc, mux, err)
 }
+
+// drainSRTCP consumes control packets so they cannot apply backpressure to the
+// shared RTP/RTCP packet mux. The connector does not currently use receiver
+// reports, but Pion still requires every discovered SRTCP stream to be read.
+func drainSRTCP(session *psrtp.SessionSRTCP) {
+	for {
+		stream, _, err := session.AcceptStream()
+		if err != nil {
+			return
+		}
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				if _, err := stream.Read(buf); err != nil {
+					return
+				}
+			}
+		}()
+	}
+}
+
 func (t *Transport) setResult(dc *pdtls.Conn, sr *psrtp.SessionSRTP, sc *psrtp.SessionSRTCP, mux *packetMux, err error) {
 	t.mu.Lock()
 	closed := t.closed
