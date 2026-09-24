@@ -17,6 +17,7 @@ import (
 	"github.com/mab3321/whatsapp-connector/internal/livekitbridge"
 	"github.com/mab3321/whatsapp-connector/internal/media"
 	"github.com/mab3321/whatsapp-connector/internal/meta"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 )
 
@@ -126,7 +127,7 @@ func (m *Manager) Accept(ctx context.Context, p AcceptParams) (string, error) {
 	if p.Timeout > 0 && p.Timeout < setupTimeout {
 		setupTimeout = p.Timeout
 	}
-	c.transport = media.NewTransport(callCtx, udp, n, setupTimeout)
+	c.transport = media.NewTransport(callCtx, udp, n, setupTimeout, m.conf.MediaTimeout)
 	m.mu.Lock()
 	if old := m.calls[p.CallID]; old != nil {
 		m.mu.Unlock()
@@ -220,7 +221,7 @@ func (m *Manager) Connect(ctx context.Context, callID, answer string, wait bool)
 			c.mu.Unlock()
 			return err
 		}
-		c.transport = media.NewTransport(c.ctx, c.udp, c.negotiation, m.conf.SetupTimeout)
+		c.transport = media.NewTransport(c.ctx, c.udp, c.negotiation, m.conf.SetupTimeout, m.conf.MediaTimeout)
 		close(c.answerReady)
 	}
 	c.mu.Unlock()
@@ -318,6 +319,7 @@ func (c *Call) connected(b *livekitbridge.Bridge) {
 	c.signalReady(nil)
 	c.log.Info("WhatsApp call connected")
 	errCh := make(chan error, 1)
+	go c.observeRTCP()
 	go func() {
 		for {
 			p, readErr := c.transport.ReadRTP()
@@ -340,6 +342,27 @@ func (c *Call) connected(b *livekitbridge.Bridge) {
 			c.log.Warn("media ended", "error", mediaErr)
 		}
 		c.stopBusiness()
+	}
+}
+
+func (c *Call) observeRTCP() {
+	for {
+		var packets []rtcp.Packet
+		select {
+		case packets = <-c.transport.RTCPReports():
+		case <-c.ctx.Done():
+			return
+		}
+		for _, packet := range packets {
+			switch report := packet.(type) {
+			case *rtcp.ReceiverReport:
+				for _, block := range report.Reports {
+					c.log.Info("Meta media reception report", "ssrc", block.SSRC, "fraction_lost", block.FractionLost, "total_lost", block.TotalLost, "jitter", block.Jitter)
+				}
+			case *rtcp.SenderReport:
+				c.log.Debug("Meta media sender report", "ssrc", report.SSRC)
+			}
+		}
 	}
 }
 

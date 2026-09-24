@@ -16,6 +16,7 @@ import (
 
 	pdtls "github.com/pion/dtls/v3"
 	pice "github.com/pion/ice/v4"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	psrtp "github.com/pion/srtp/v3"
 )
@@ -24,6 +25,7 @@ type Transport struct {
 	conf                 *Negotiation
 	raw                  *net.UDPConn
 	timeout              time.Duration
+	mediaTimeout         time.Duration
 	ctx                  context.Context
 	cancel               context.CancelFunc
 	ready                chan struct{}
@@ -39,13 +41,14 @@ type Transport struct {
 	iceMux               pice.UDPMux
 	readMu               sync.Mutex
 	read                 *psrtp.ReadStreamSRTP
+	rtcpReports          chan []rtcp.Packet
 	writeMu              sync.Mutex
 	write                *psrtp.WriteStreamSRTP
 }
 
-func NewTransport(parent context.Context, raw *net.UDPConn, conf *Negotiation, timeout time.Duration) *Transport {
+func NewTransport(parent context.Context, raw *net.UDPConn, conf *Negotiation, timeout, mediaTimeout time.Duration) *Transport {
 	ctx, cancel := context.WithCancel(parent)
-	return &Transport{conf: conf, raw: raw, timeout: timeout, ctx: ctx, cancel: cancel, ready: make(chan struct{})}
+	return &Transport{conf: conf, raw: raw, timeout: timeout, mediaTimeout: mediaTimeout, ctx: ctx, cancel: cancel, ready: make(chan struct{}), rtcpReports: make(chan []rtcp.Packet, 32)}
 }
 func (t *Transport) Start() { t.startOnce.Do(func() { go t.run() }) }
 func (t *Transport) run() {
@@ -123,11 +126,9 @@ func (t *Transport) run() {
 				if err == nil {
 					sc, err = psrtp.NewSessionSRTCP(mux.srtcp, scfg)
 					if err == nil {
-						// SessionSRTCP blocks its reader when a newly discovered
-						// stream is not accepted. Because RTP and RTCP share the
-						// packet mux, leaving RTCP unread eventually fills the RTCP
-						// endpoint buffer and stalls inbound RTP as well.
-						go drainSRTCP(sc)
+						// Accept and read every RTCP stream so control traffic cannot
+						// block the shared RTP/RTCP packet mux.
+						go drainSRTCP(sc, t.rtcpReports)
 					}
 				}
 			}
@@ -136,20 +137,28 @@ func (t *Transport) run() {
 	t.setResult(dc, sr, sc, mux, err)
 }
 
-// drainSRTCP consumes control packets so they cannot apply backpressure to the
-// shared RTP/RTCP packet mux. The connector does not currently use receiver
-// reports, but Pion still requires every discovered SRTCP stream to be read.
-func drainSRTCP(session *psrtp.SessionSRTCP) {
+// drainSRTCP consumes every discovered stream. Diagnostics are best effort;
+// logging must never hold up the SRTCP reader or the shared packet mux.
+func drainSRTCP(session *psrtp.SessionSRTCP, reports chan<- []rtcp.Packet) {
 	for {
 		stream, _, err := session.AcceptStream()
 		if err != nil {
 			return
 		}
 		go func() {
+			defer stream.Close()
 			buf := make([]byte, 2048)
 			for {
-				if _, err := stream.Read(buf); err != nil {
+				n, err := stream.Read(buf)
+				if err != nil {
 					return
+				}
+				packets, err := rtcp.Unmarshal(buf[:n])
+				if err == nil {
+					select {
+					case reports <- packets:
+					default:
+					}
 				}
 			}
 		}()
@@ -271,9 +280,14 @@ func (t *Transport) ReadRTP() (*rtp.Packet, error) {
 	t.readMu.Unlock()
 	buf := make([]byte, 1600)
 	for {
+		if t.mediaTimeout > 0 {
+			if err := stream.SetReadDeadline(time.Now().Add(t.mediaTimeout)); err != nil {
+				return nil, err
+			}
+		}
 		n, e := stream.Read(buf)
 		if e != nil {
-			return nil, e
+			return nil, fmt.Errorf("inbound RTP stopped: %w", e)
 		}
 		var p rtp.Packet
 		if e = p.Unmarshal(buf[:n]); e == nil {
@@ -281,6 +295,10 @@ func (t *Transport) ReadRTP() (*rtp.Packet, error) {
 		}
 	}
 }
+
+// RTCPReports exposes Meta-side feedback for diagnostics. It is independent
+// of the LiveKit RTCP session and is intentionally not forwarded to it.
+func (t *Transport) RTCPReports() <-chan []rtcp.Packet { return t.rtcpReports }
 func (t *Transport) WriteRTP(p *rtp.Packet) error {
 	if err := t.Wait(); err != nil {
 		return err

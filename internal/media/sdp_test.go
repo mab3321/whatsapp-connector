@@ -43,8 +43,9 @@ func TestParseOfferAndAnswer(t *testing.T) {
 func TestRejectsNonOpusAndMissingFingerprint(t *testing.T) {
 	cert, _ := NewCertificate()
 	for name, offer := range map[string]string{
-		"codec":       strings.Replace(testOffer, "opus/48000/2", "PCMU/8000", 1),
-		"fingerprint": strings.Replace(testOffer, "a=fingerprint:", "a=x-fingerprint:", 1),
+		"codec":          strings.Replace(testOffer, "opus/48000/2", "PCMU/8000", 1),
+		"fingerprint":    strings.Replace(testOffer, "a=fingerprint:", "a=x-fingerprint:", 1),
+		"unoffered opus": strings.Replace(testOffer, "m=audio 3480 UDP/TLS/RTP/SAVPF 111", "m=audio 3480 UDP/TLS/RTP/SAVPF 0", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ParseOfferAndAnswer(offer, cert, netip.MustParseAddr("203.0.113.20"), 40001); err == nil {

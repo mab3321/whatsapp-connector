@@ -280,11 +280,19 @@ func opusPayload(m *psdp.MediaDescription) (uint8, error) {
 			continue
 		}
 		v, e := strconv.Atoi(f[0])
-		if e == nil && v >= 0 && v <= 127 {
+		if e == nil && v >= 0 && v <= 127 && offeredFormat(m, f[0]) {
 			return uint8(v), nil
 		}
 	}
 	return 0, fmt.Errorf("%w: opus/48000/2 missing", ErrInvalidSDP)
+}
+func offeredFormat(m *psdp.MediaDescription, format string) bool {
+	for _, offered := range m.MediaName.Formats {
+		if offered == format {
+			return true
+		}
+	}
+	return false
 }
 func remoteCandidates(m *psdp.MediaDescription) ([]ICECandidate, error) {
 	var out []ICECandidate

@@ -18,7 +18,7 @@ func TestImmediateCloseInterruptsICE(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr := NewTransport(context.Background(), udp, n, 10*time.Second)
+	tr := NewTransport(context.Background(), udp, n, 10*time.Second, 20*time.Second)
 	tr.Start()
 	start := time.Now()
 	if err := tr.Close(); err != nil {
