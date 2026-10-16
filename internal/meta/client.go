@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -14,10 +16,68 @@ import (
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
+	// Backoff returns the pause before retry number n (1-based). Tests replace it.
+	Backoff func(n int) time.Duration
+}
+
+// maxAttempts is the total number of tries for a retryable request.
+const maxAttempts = 3
+
+// retryPolicy says which failures may be retried for an action.
+type retryPolicy int
+
+const (
+	// retryNever: the request may have side effects that a repeat would
+	// duplicate (placing an outbound call).
+	retryNever retryPolicy = iota
+	// retryUnprocessed: retry only when the request was clearly not processed
+	// (could not connect, or the API said it is overloaded). Used for
+	// pre_accept and accept, where a repeat after a lost response could turn a
+	// success into an error.
+	retryUnprocessed
+	// retryAny: terminate is safe to repeat, so retry timeouts and 5xx too.
+	retryAny
+)
+
+type httpStatusError struct {
+	code int
+	msg  string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("Meta calls API returned HTTP %d: %s", e.code, e.msg)
+}
+
+func retryable(policy retryPolicy, err error) bool {
+	if policy == retryNever || err == nil {
+		return false
+	}
+	var se *httpStatusError
+	if errors.As(err, &se) {
+		if se.code == http.StatusTooManyRequests || se.code == http.StatusServiceUnavailable {
+			return true
+		}
+		return policy == retryAny && se.code >= 500
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var op *net.OpError
+	if errors.As(err, &op) && op.Op == "dial" {
+		return true // never connected, so nothing was processed
+	}
+	return policy == retryAny // timeouts and resets after the request left
 }
 
 func New() *Client {
 	return &Client{BaseURL: "https://graph.facebook.com", HTTP: &http.Client{Timeout: 10 * time.Second}}
+}
+
+func (c *Client) backoff(n int) time.Duration {
+	if c.Backoff != nil {
+		return c.Backoff(n)
+	}
+	return time.Duration(n) * 400 * time.Millisecond
 }
 
 type callRequest struct {
@@ -34,15 +94,15 @@ type session struct {
 }
 
 func (c *Client) PreAccept(ctx context.Context, version, phoneID, token, callID, sdp string) error {
-	_, err := c.call(ctx, version, phoneID, token, callRequest{MessagingProduct: "whatsapp", CallID: callID, Action: "pre_accept", Session: &session{"answer", sdp}})
+	_, err := c.call(ctx, retryUnprocessed, version, phoneID, token, callRequest{MessagingProduct: "whatsapp", CallID: callID, Action: "pre_accept", Session: &session{"answer", sdp}})
 	return err
 }
 func (c *Client) Accept(ctx context.Context, version, phoneID, token, callID, sdp string) error {
-	_, err := c.call(ctx, version, phoneID, token, callRequest{MessagingProduct: "whatsapp", CallID: callID, Action: "accept", Session: &session{"answer", sdp}})
+	_, err := c.call(ctx, retryUnprocessed, version, phoneID, token, callRequest{MessagingProduct: "whatsapp", CallID: callID, Action: "accept", Session: &session{"answer", sdp}})
 	return err
 }
 func (c *Client) Terminate(ctx context.Context, version, phoneID, token, callID string) error {
-	_, err := c.call(ctx, version, phoneID, token, callRequest{MessagingProduct: "whatsapp", CallID: callID, Action: "terminate"})
+	_, err := c.call(ctx, retryAny, version, phoneID, token, callRequest{MessagingProduct: "whatsapp", CallID: callID, Action: "terminate"})
 	return err
 }
 
@@ -51,10 +111,28 @@ func (c *Client) Dial(ctx context.Context, version, phoneID, token, to, opaque, 
 	if to == "" {
 		return "", fmt.Errorf("WhatsApp destination is required")
 	}
-	return c.call(ctx, version, phoneID, token, callRequest{MessagingProduct: "whatsapp", To: to, Action: "connect", Session: &session{"offer", sdp}, Opaque: opaque})
+	return c.call(ctx, retryNever, version, phoneID, token, callRequest{MessagingProduct: "whatsapp", To: to, Action: "connect", Session: &session{"offer", sdp}, Opaque: opaque})
 }
 
-func (c *Client) call(ctx context.Context, version, phoneID, token string, body callRequest) (string, error) {
+// call performs the request, retrying transient failures according to policy.
+func (c *Client) call(ctx context.Context, policy retryPolicy, version, phoneID, token string, body callRequest) (string, error) {
+	var out string
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		out, err = c.callOnce(ctx, version, phoneID, token, body)
+		if err == nil || attempt == maxAttempts || !retryable(policy, err) {
+			return out, err
+		}
+		select {
+		case <-time.After(c.backoff(attempt)):
+		case <-ctx.Done():
+			return "", err
+		}
+	}
+	return out, err
+}
+
+func (c *Client) callOnce(ctx context.Context, version, phoneID, token string, body callRequest) (string, error) {
 	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
 	if version == "" {
 		return "", fmt.Errorf("WhatsApp API version is required")
@@ -91,7 +169,7 @@ func (c *Client) call(ctx context.Context, version, phoneID, token string, body 
 		return "", nil
 	}
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	return "", fmt.Errorf("Meta calls API returned HTTP %d: %s", resp.StatusCode, sanitize(string(b)))
+	return "", &httpStatusError{code: resp.StatusCode, msg: sanitize(string(b))}
 }
 
 func sanitize(s string) string {

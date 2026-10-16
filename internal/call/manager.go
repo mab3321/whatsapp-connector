@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -29,6 +28,10 @@ type Config struct {
 	// MaxCallDuration is a hard cap that ends a connected call even if no
 	// other signal (Meta hang-up, media timeout, LiveKit disconnect) arrives.
 	MaxCallDuration time.Duration
+	// RTCPInterval is how often receiver/sender reports are sent to Meta;
+	// zero disables them. StatsInterval is how often media counters are logged;
+	// zero disables the periodic line (the final summary is always logged).
+	RTCPInterval, StatsInterval time.Duration
 }
 
 type AcceptParams struct {
@@ -269,7 +272,7 @@ func (m *Manager) runInbound(c *Call, payload uint8) {
 		c.fail(err)
 		return
 	}
-	c.connected(b, m.conf.MaxCallDuration)
+	c.connected(b, m.conf)
 }
 
 func (m *Manager) connectBridge(c *Call, payload uint8) (*livekitbridge.Bridge, error) {
@@ -315,15 +318,22 @@ func (m *Manager) runOutbound(c *Call) {
 		c.fail(err)
 		return
 	}
-	c.connected(b, m.conf.MaxCallDuration)
+	c.connected(b, m.conf)
 }
 
-func (c *Call) connected(b *livekitbridge.Bridge, maxDuration time.Duration) {
+func (c *Call) connected(b *livekitbridge.Bridge, conf Config) {
+	maxDuration := conf.MaxCallDuration
 	c.signalReady(nil)
 	c.log.Info("WhatsApp call connected")
 	started := time.Now()
 	errCh := make(chan error, 1)
 	go c.observeRTCP()
+	if conf.RTCPInterval > 0 {
+		go c.transport.RunRTCP(c.ctx, conf.RTCPInterval)
+	}
+	if conf.StatsInterval > 0 {
+		go c.logStats(b, conf.StatsInterval)
+	}
 	go func() {
 		for {
 			p, readErr := c.transport.ReadRTP()
@@ -338,7 +348,35 @@ func (c *Call) connected(b *livekitbridge.Bridge, maxDuration time.Duration) {
 		}
 	}()
 	reason := c.awaitEnd(b.Done(), errCh, maxDuration)
-	c.log.Info("WhatsApp call ended", "reason", reason, "duration", time.Since(started).Round(time.Second))
+	c.log.Info("WhatsApp call ended", append([]any{"reason", reason, "duration", time.Since(started).Round(time.Second)}, c.statsAttrs(b)...)...)
+}
+
+// statsAttrs returns media counters for logging. Counters only: no audio, no
+// identifiers, no payload content.
+func (c *Call) statsAttrs(b *livekitbridge.Bridge) []any {
+	ts := c.transport.Stats()
+	bs := b.Stats()
+	return []any{
+		"rx_packets", ts.RxPackets, "rx_lost", ts.RxLost, "rx_reordered", ts.RxReordered,
+		"rx_dropped", ts.RxDropped, "rx_jitter_ms", int(ts.RxJitterMs + 0.5),
+		"tx_packets", bs.TxPackets, "tx_not_ready_dropped", bs.TxDropped, "tx_write_errors", bs.TxWriteErrors,
+	}
+}
+
+// logStats periodically logs media counters so a quality complaint can be
+// diagnosed after the fact (loss, reordering and jitter on the Meta leg, and
+// whether agent audio was dropped or failed to send).
+func (c *Call) logStats(b *livekitbridge.Bridge, every time.Duration) {
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-tick.C:
+			c.log.Info("media stats", c.statsAttrs(b)...)
+		}
+	}
 }
 
 // End reasons are logged so a call that lingers can be explained afterwards.
@@ -408,21 +446,29 @@ func (c *Call) observeRTCP() {
 	}
 }
 
+// writeToMeta forwards agent audio to Meta without ever blocking. While the
+// Meta media path is not up (or an outbound call has no answer yet) packets are
+// dropped, not queued: delivering seconds of stale greeting in one burst would
+// be discarded or garbled by the receiver anyway.
 func (c *Call) writeToMeta(p *rtp.Packet) error {
 	if c.outbound {
 		select {
 		case <-c.answerReady:
-		case <-c.ctx.Done():
-			return c.ctx.Err()
+		default:
+			return livekitbridge.ErrNotReady
 		}
 	}
 	c.mu.Lock()
 	t := c.transport
 	c.mu.Unlock()
 	if t == nil {
-		return io.ErrClosedPipe
+		return livekitbridge.ErrNotReady
 	}
-	return t.WriteRTP(p)
+	err := t.TryWriteRTP(p)
+	if errors.Is(err, media.ErrNotReady) {
+		return livekitbridge.ErrNotReady
+	}
+	return err
 }
 
 func (c *Call) signalReady(err error) {
