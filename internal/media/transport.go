@@ -255,6 +255,48 @@ func (t *Transport) Wait() error {
 	defer t.mu.RUnlock()
 	return t.err
 }
+
+// streamAcceptor is the part of an SRTP session that waits for the first
+// inbound RTP stream.
+type streamAcceptor interface {
+	AcceptStream() (*psrtp.ReadStreamSRTP, uint32, error)
+}
+
+// ErrNoInboundRTP is returned when Meta never sends a single RTP packet.
+var ErrNoInboundRTP = errors.New("no inbound RTP received")
+
+// acceptStream waits for the first inbound RTP stream, but not forever.
+// AcceptStream has no deadline of its own and returns only once a packet
+// arrives, so without this bound a call whose media never starts would never
+// hit the media timeout (which only applies to reads on an accepted stream)
+// and would stay connected until something outside the connector hung it up.
+// A timeout <= 0 waits until the transport context ends.
+func acceptStream(ctx context.Context, s streamAcceptor, timeout time.Duration) (*psrtp.ReadStreamSRTP, error) {
+	type result struct {
+		stream *psrtp.ReadStreamSRTP
+		err    error
+	}
+	res := make(chan result, 1)
+	go func() {
+		stream, _, err := s.AcceptStream()
+		res <- result{stream, err}
+	}()
+	var expired <-chan time.Time
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		expired = timer.C
+	}
+	select {
+	case r := <-res:
+		return r.stream, r.err
+	case <-expired:
+		return nil, fmt.Errorf("%w within %s", ErrNoInboundRTP, timeout)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (t *Transport) ReadRTP() (*rtp.Packet, error) {
 	if err := t.Wait(); err != nil {
 		return nil, err
@@ -270,7 +312,7 @@ func (t *Transport) ReadRTP() (*rtp.Packet, error) {
 			return nil, io.EOF
 		}
 		var err error
-		stream, _, err = s.AcceptStream()
+		stream, err = acceptStream(t.ctx, s, t.mediaTimeout)
 		if err != nil {
 			t.readMu.Unlock()
 			return nil, err
