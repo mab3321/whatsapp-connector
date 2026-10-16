@@ -9,9 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pdtls "github.com/pion/dtls/v3"
@@ -39,16 +42,34 @@ type Transport struct {
 	srtcp                *psrtp.SessionSRTCP
 	iceAgent             *pice.Agent
 	iceMux               pice.UDPMux
-	readMu               sync.Mutex
-	read                 *psrtp.ReadStreamSRTP
 	rtcpReports          chan []rtcp.Packet
 	writeMu              sync.Mutex
 	write                *psrtp.WriteStreamSRTP
+
+	// Inbound RTP is pumped from every accepted SRTP stream into rtpIn so a
+	// change of the Meta SSRC mid-call is followed instead of silently ignored.
+	rtpIn       chan *rtp.Packet
+	pumpOnce    sync.Once
+	pumpDone    chan struct{}
+	pumpErr     error
+	pumpErrOnce sync.Once
+	sawRTP      atomic.Bool
+	rxDropped   atomic.Uint64
+
+	rx       rxStats
+	tx       txStats
+	rtcpSSRC uint32
+	rtcpMu   sync.Mutex
+	rtcpOut  *psrtp.WriteStreamSRTCP
 }
+
+// rtpQueueSize bounds buffered inbound packets (about 5 s of 20 ms audio).
+const rtpQueueSize = 256
 
 func NewTransport(parent context.Context, raw *net.UDPConn, conf *Negotiation, timeout, mediaTimeout time.Duration) *Transport {
 	ctx, cancel := context.WithCancel(parent)
-	return &Transport{conf: conf, raw: raw, timeout: timeout, mediaTimeout: mediaTimeout, ctx: ctx, cancel: cancel, ready: make(chan struct{}), rtcpReports: make(chan []rtcp.Packet, 32)}
+	return &Transport{conf: conf, raw: raw, timeout: timeout, mediaTimeout: mediaTimeout, ctx: ctx, cancel: cancel, ready: make(chan struct{}), rtcpReports: make(chan []rtcp.Packet, 32),
+		rtpIn: make(chan *rtp.Packet, rtpQueueSize), pumpDone: make(chan struct{}), rtcpSSRC: rand.Uint32()}
 }
 func (t *Transport) Start() { t.startOnce.Do(func() { go t.run() }) }
 func (t *Transport) run() {
@@ -128,18 +149,26 @@ func (t *Transport) run() {
 					if err == nil {
 						// Accept and read every RTCP stream so control traffic cannot
 						// block the shared RTP/RTCP packet mux.
-						go drainSRTCP(sc, t.rtcpReports)
+						go t.drainSRTCP(sc)
 					}
 				}
 			}
 		}
 	}
 	t.setResult(dc, sr, sc, mux, err)
+	if err == nil && sr != nil {
+		// Consume inbound RTP from the moment the session exists, not from the
+		// first ReadRTP call, so nothing queues up unread in the shared mux.
+		t.startPump(sr)
+	}
 }
 
-// drainSRTCP consumes every discovered stream. Diagnostics are best effort;
-// logging must never hold up the SRTCP reader or the shared packet mux.
-func drainSRTCP(session *psrtp.SessionSRTCP, reports chan<- []rtcp.Packet) {
+// drainSRTCP consumes every discovered SRTCP stream. Consuming is mandatory:
+// the SRTCP session shares one packet mux with RTP and DTLS, so an unread
+// stream would eventually back up the mux and stall the whole call. Nothing in
+// here may block: diagnostics are best effort and the sender report hook only
+// takes a short mutex.
+func (t *Transport) drainSRTCP(session *psrtp.SessionSRTCP) {
 	for {
 		stream, _, err := session.AcceptStream()
 		if err != nil {
@@ -154,11 +183,17 @@ func drainSRTCP(session *psrtp.SessionSRTCP, reports chan<- []rtcp.Packet) {
 					return
 				}
 				packets, err := rtcp.Unmarshal(buf[:n])
-				if err == nil {
-					select {
-					case reports <- packets:
-					default:
+				if err != nil {
+					continue
+				}
+				for _, pkt := range packets {
+					if sr, ok := pkt.(*rtcp.SenderReport); ok {
+						t.rx.noteSenderReport(sr.NTPTime, time.Now())
 					}
+				}
+				select {
+				case t.rtcpReports <- packets:
+				default:
 				}
 			}
 		}()
@@ -256,8 +291,8 @@ func (t *Transport) Wait() error {
 	return t.err
 }
 
-// streamAcceptor is the part of an SRTP session that waits for the first
-// inbound RTP stream.
+// streamAcceptor is the part of an SRTP session that hands out inbound RTP
+// streams, one per SSRC.
 type streamAcceptor interface {
 	AcceptStream() (*psrtp.ReadStreamSRTP, uint32, error)
 }
@@ -265,82 +300,94 @@ type streamAcceptor interface {
 // ErrNoInboundRTP is returned when Meta never sends a single RTP packet.
 var ErrNoInboundRTP = errors.New("no inbound RTP received")
 
-// acceptStream waits for the first inbound RTP stream, but not forever.
-// AcceptStream has no deadline of its own and returns only once a packet
-// arrives, so without this bound a call whose media never starts would never
-// hit the media timeout (which only applies to reads on an accepted stream)
-// and would stay connected until something outside the connector hung it up.
-// A timeout <= 0 waits until the transport context ends.
-func acceptStream(ctx context.Context, s streamAcceptor, timeout time.Duration) (*psrtp.ReadStreamSRTP, error) {
-	type result struct {
-		stream *psrtp.ReadStreamSRTP
-		err    error
-	}
-	res := make(chan result, 1)
-	go func() {
+// ErrNotReady is returned by TryWriteRTP while the media path is still being
+// established.
+var ErrNotReady = errors.New("meta media path not ready")
+
+func (t *Transport) startPump(s streamAcceptor) {
+	t.pumpOnce.Do(func() { go t.acceptLoop(s) })
+}
+
+// acceptLoop keeps accepting streams for the life of the session. A new SSRC
+// (Meta restarting its sender, for example) gets its own reader feeding the
+// same queue.
+func (t *Transport) acceptLoop(s streamAcceptor) {
+	for {
 		stream, _, err := s.AcceptStream()
-		res <- result{stream, err}
-	}()
-	var expired <-chan time.Time
-	if timeout > 0 {
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
-		expired = timer.C
-	}
-	select {
-	case r := <-res:
-		return r.stream, r.err
-	case <-expired:
-		return nil, fmt.Errorf("%w within %s", ErrNoInboundRTP, timeout)
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		if err != nil {
+			t.pumpErrOnce.Do(func() { t.pumpErr = err; close(t.pumpDone) })
+			return
+		}
+		go t.readStream(stream)
 	}
 }
 
+// readStream copies valid RTP packets into the queue. It never blocks: if the
+// consumer falls behind the oldest packet is dropped, because a backed-up
+// reader would stall the shared packet mux that DTLS and RTCP also use, and
+// stale audio is worth less than a live call.
+func (t *Transport) readStream(r io.Reader) {
+	buf := make([]byte, 1600)
+	for {
+		n, err := r.Read(buf)
+		if err != nil {
+			return
+		}
+		var p rtp.Packet
+		if p.Unmarshal(append([]byte(nil), buf[:n]...)) != nil {
+			continue
+		}
+		t.rx.update(&p, time.Now())
+		t.sawRTP.Store(true)
+		select {
+		case t.rtpIn <- &p:
+		default:
+			select {
+			case <-t.rtpIn:
+				t.rxDropped.Add(1)
+			default:
+			}
+			select {
+			case t.rtpIn <- &p:
+			default:
+				t.rxDropped.Add(1)
+			}
+		}
+	}
+}
+
+// ReadRTP returns the next inbound RTP packet. If nothing arrives within the
+// media timeout it fails, whether no media ever started (ErrNoInboundRTP) or
+// it stopped mid-call.
 func (t *Transport) ReadRTP() (*rtp.Packet, error) {
 	if err := t.Wait(); err != nil {
 		return nil, err
 	}
-	t.readMu.Lock()
-	stream := t.read
-	if stream == nil {
-		t.mu.RLock()
-		s := t.srtp
-		t.mu.RUnlock()
-		if s == nil {
-			t.readMu.Unlock()
-			return nil, io.EOF
-		}
-		var err error
-		stream, err = acceptStream(t.ctx, s, t.mediaTimeout)
-		if err != nil {
-			t.readMu.Unlock()
-			return nil, err
-		}
-		t.read = stream
+	t.mu.RLock()
+	s := t.srtp
+	t.mu.RUnlock()
+	if s == nil {
+		return nil, io.EOF
 	}
-	t.readMu.Unlock()
-	buf := make([]byte, 1600)
-	// The deadline is fixed per call to ReadRTP so packets that fail to parse
-	// cannot keep extending it; only a valid RTP packet resets the window.
-	var deadline time.Time
+	t.startPump(s)
+	var expired <-chan time.Time
 	if t.mediaTimeout > 0 {
-		deadline = time.Now().Add(t.mediaTimeout)
+		timer := time.NewTimer(t.mediaTimeout)
+		defer timer.Stop()
+		expired = timer.C
 	}
-	for {
-		if !deadline.IsZero() {
-			if err := stream.SetReadDeadline(deadline); err != nil {
-				return nil, err
-			}
+	select {
+	case p := <-t.rtpIn:
+		return p, nil
+	case <-expired:
+		if t.sawRTP.Load() {
+			return nil, fmt.Errorf("inbound RTP stopped: %w", os.ErrDeadlineExceeded)
 		}
-		n, e := stream.Read(buf)
-		if e != nil {
-			return nil, fmt.Errorf("inbound RTP stopped: %w", e)
-		}
-		var p rtp.Packet
-		if e = p.Unmarshal(buf[:n]); e == nil {
-			return &p, nil
-		}
+		return nil, fmt.Errorf("%w within %s", ErrNoInboundRTP, t.mediaTimeout)
+	case <-t.pumpDone:
+		return nil, fmt.Errorf("inbound RTP stopped: %w", t.pumpErr)
+	case <-t.ctx.Done():
+		return nil, t.ctx.Err()
 	}
 }
 
@@ -351,6 +398,28 @@ func (t *Transport) WriteRTP(p *rtp.Packet) error {
 	if err := t.Wait(); err != nil {
 		return err
 	}
+	return t.writeRTP(p)
+}
+
+// TryWriteRTP sends without waiting for the media path. Until it is up it
+// returns ErrNotReady so callers drop the packet instead of queueing stale
+// audio that would later arrive as one burst.
+func (t *Transport) TryWriteRTP(p *rtp.Packet) error {
+	select {
+	case <-t.ready:
+	default:
+		return ErrNotReady
+	}
+	t.mu.RLock()
+	err := t.err
+	t.mu.RUnlock()
+	if err != nil {
+		return err
+	}
+	return t.writeRTP(p)
+}
+
+func (t *Transport) writeRTP(p *rtp.Packet) error {
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 	t.mu.RLock()
@@ -370,9 +439,96 @@ func (t *Transport) WriteRTP(p *rtp.Packet) error {
 	if e != nil {
 		return e
 	}
-	_, e = t.write.Write(b)
-	return e
+	if _, e = t.write.Write(b); e != nil {
+		return e
+	}
+	t.tx.sent(p, time.Now())
+	return nil
 }
+
+// Stats is a snapshot of media quality for logging. It contains counters only.
+type Stats struct {
+	RxPackets   uint32
+	RxLost      int64
+	RxReordered uint64
+	RxDropped   uint64
+	RxJitterMs  float64
+	TxPackets   uint32
+}
+
+func (t *Transport) Stats() Stats {
+	rx := t.rx.snapshot()
+	t.tx.mu.Lock()
+	tx := t.tx.packets
+	t.tx.mu.Unlock()
+	return Stats{RxPackets: rx.Received, RxLost: rx.Lost, RxReordered: rx.Reordered, RxDropped: t.rxDropped.Load(), RxJitterMs: rx.JitterMs, TxPackets: tx}
+}
+
+// buildRTCP assembles the compound report sent to Meta: a sender report when
+// audio has been sent (otherwise a receiver report), carrying the reception
+// block for the Meta stream, plus the mandatory SDES CNAME.
+func (t *Transport) buildRTCP(now time.Time) []rtcp.Packet {
+	var blocks []rtcp.ReceptionReport
+	if rr, ok := t.rx.report(now); ok {
+		blocks = append(blocks, rr)
+	}
+	var head rtcp.Packet
+	ssrc := t.rtcpSSRC
+	if sr, ok := t.tx.senderReport(now); ok {
+		sr.Reports = blocks
+		head, ssrc = sr, sr.SSRC
+	} else {
+		head = &rtcp.ReceiverReport{SSRC: ssrc, Reports: blocks}
+	}
+	sdes := &rtcp.SourceDescription{Chunks: []rtcp.SourceDescriptionChunk{{
+		Source: ssrc, Items: []rtcp.SourceDescriptionItem{{Type: rtcp.SDESCNAME, Text: "whatsapp-connector"}},
+	}}}
+	return []rtcp.Packet{head, sdes}
+}
+
+func (t *Transport) sendRTCP(now time.Time) error {
+	raw, err := rtcp.Marshal(t.buildRTCP(now))
+	if err != nil {
+		return err
+	}
+	t.mu.RLock()
+	sc := t.srtcp
+	t.mu.RUnlock()
+	if sc == nil {
+		return io.EOF
+	}
+	t.rtcpMu.Lock()
+	defer t.rtcpMu.Unlock()
+	if t.rtcpOut == nil {
+		if t.rtcpOut, err = sc.OpenWriteStream(); err != nil {
+			return err
+		}
+	}
+	_, err = t.rtcpOut.Write(raw)
+	return err
+}
+
+// RunRTCP sends periodic receiver/sender reports to Meta until ctx ends.
+// Without them Meta gets no loss or jitter feedback from the connector and
+// cannot adapt its sender. Failures are ignored: reports are best effort.
+func (t *Transport) RunRTCP(ctx context.Context, interval time.Duration) {
+	if interval <= 0 || t.Wait() != nil {
+		return
+	}
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.ctx.Done():
+			return
+		case now := <-tick.C:
+			_ = t.sendRTCP(now)
+		}
+	}
+}
+
 func (t *Transport) Close() error {
 	t.closeOnce.Do(func() {
 		t.cancel()

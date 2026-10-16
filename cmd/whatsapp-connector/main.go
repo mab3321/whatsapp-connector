@@ -29,6 +29,7 @@ func main() {
 		LiveKitURL: conf.LiveKitURL, APIKey: conf.LiveKitAPIKey, APISecret: conf.LiveKitSecret,
 		PublicIP: conf.PublicIP, PortMin: conf.PortMin, PortMax: conf.PortMax,
 		SetupTimeout: conf.SetupTimeout, MediaTimeout: conf.MediaTimeout, MaxCallDuration: conf.MaxCallDuration,
+		RTCPInterval: conf.RTCPInterval, StatsInterval: conf.StatsInterval,
 	}, meta.New())
 	service := connectorservice.NewService(manager)
 	twirpHandler := livekit.NewConnectorServer(service)

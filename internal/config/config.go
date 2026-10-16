@@ -20,6 +20,8 @@ type Config struct {
 	SetupTimeout    time.Duration
 	MediaTimeout    time.Duration
 	MaxCallDuration time.Duration
+	RTCPInterval    time.Duration
+	StatsInterval   time.Duration
 	ShutdownWindow  time.Duration
 }
 
@@ -34,6 +36,8 @@ func Load() (Config, error) {
 		SetupTimeout:    envDuration("SETUP_TIMEOUT", 30*time.Second),
 		MediaTimeout:    envDuration("MEDIA_TIMEOUT", 20*time.Second),
 		MaxCallDuration: envDuration("MAX_CALL_DURATION", 2*time.Hour),
+		RTCPInterval:    envDurationOrOff("RTCP_INTERVAL", 2*time.Second),
+		StatsInterval:   envDurationOrOff("STATS_INTERVAL", 15*time.Second),
 		ShutdownWindow:  envDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
 	}
 	var err error
@@ -62,6 +66,15 @@ func envInt(k string, d int) int {
 		return v
 	}
 	return d
+}
+
+// envDurationOrOff is like envDuration but treats "0" or "off" as disabled.
+func envDurationOrOff(k string, d time.Duration) time.Duration {
+	switch os.Getenv(k) {
+	case "0", "off", "false":
+		return 0
+	}
+	return envDuration(k, d)
 }
 func envDuration(k string, d time.Duration) time.Duration {
 	v, err := time.ParseDuration(os.Getenv(k))

@@ -7,6 +7,10 @@ import (
 	"log/slog"
 	"testing"
 	"time"
+
+	"github.com/mab3321/whatsapp-connector/internal/livekitbridge"
+	"github.com/mab3321/whatsapp-connector/internal/media"
+	"github.com/pion/rtp"
 )
 
 func testCall() *Call {
@@ -93,5 +97,31 @@ func TestUserHangupDoesNotTerminateMeta(t *testing.T) {
 	}
 	if c.terminate {
 		t.Fatal("Meta already ended the call; connector must not terminate it again")
+	}
+}
+
+// Agent audio must never block while the Meta media path is not up: the
+// bridge keeps reading its track and drops the packet.
+func TestWriteToMetaNeverBlocksBeforeReady(t *testing.T) {
+	c := testCall()
+	c.transport = media.NewTransport(context.Background(), nil, nil, time.Second, time.Second)
+	done := make(chan error, 1)
+	go func() { done <- c.writeToMeta(&rtp.Packet{}) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, livekitbridge.ErrNotReady) {
+			t.Fatalf("err = %v, want ErrNotReady", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("writeToMeta blocked before the media path was ready")
+	}
+}
+
+func TestWriteToMetaDropsOutboundAudioUntilAnswered(t *testing.T) {
+	c := testCall()
+	c.outbound = true
+	c.answerReady = make(chan struct{})
+	if err := c.writeToMeta(&rtp.Packet{}); !errors.Is(err, livekitbridge.ErrNotReady) {
+		t.Fatalf("err = %v, want ErrNotReady before the callee answers", err)
 	}
 }

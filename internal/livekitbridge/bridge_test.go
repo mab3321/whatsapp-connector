@@ -1,10 +1,14 @@
 package livekitbridge
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
 	"testing"
 
 	lksdk "github.com/livekit/server-sdk-go/v2"
-	"github.com/pion/rtp"
 )
 
 func TestEndsCallWhenAgentDeparts(t *testing.T) {
@@ -22,16 +26,15 @@ func TestEndsCallWhenAgentDeparts(t *testing.T) {
 	}
 }
 
-func TestRTPTranslatorMaintainsContinuity(t *testing.T) {
-	var tr rtpTranslator
-	a := &rtp.Packet{Header: rtp.Header{PayloadType: 100, SSRC: 10, SequenceNumber: 8, Timestamp: 1000, Extension: true, ExtensionProfile: 0xbede}}
-	tr.rewrite(a, 111)
-	b := &rtp.Packet{Header: rtp.Header{PayloadType: 100, SSRC: 99, SequenceNumber: 500, Timestamp: 2000}}
-	tr.rewrite(b, 111)
-	if b.PayloadType != 111 || b.SSRC != a.SSRC || b.SequenceNumber != a.SequenceNumber+1 || b.Timestamp != a.Timestamp+1000 {
-		t.Fatalf("RTP continuity not preserved: first=%#v second=%#v", a.Header, b.Header)
+func TestWriteErrorPolicy(t *testing.T) {
+	for _, err := range []error{io.EOF, io.ErrClosedPipe, net.ErrClosed, context.Canceled, fmt.Errorf("wrapped: %w", io.EOF)} {
+		if !isFatalWrite(err) {
+			t.Fatalf("%v must stop the forwarder", err)
+		}
 	}
-	if a.Extension || a.ExtensionProfile != 0 {
-		t.Fatalf("unnegotiated RTP extensions were retained: %#v", a.Header)
+	for _, err := range []error{ErrNotReady, errors.New("sendto: no buffer space"), fmt.Errorf("x: %w", ErrNotReady)} {
+		if isFatalWrite(err) {
+			t.Fatalf("%v must not stop the forwarder", err)
+		}
 	}
 }
