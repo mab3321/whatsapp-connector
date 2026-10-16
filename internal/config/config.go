@@ -10,29 +10,31 @@ import (
 )
 
 type Config struct {
-	HTTPAddr       string
-	LiveKitURL     string
-	LiveKitAPIKey  string
-	LiveKitSecret  string
-	PublicIP       netip.Addr
-	PortMin        int
-	PortMax        int
-	SetupTimeout   time.Duration
-	MediaTimeout   time.Duration
-	ShutdownWindow time.Duration
+	HTTPAddr        string
+	LiveKitURL      string
+	LiveKitAPIKey   string
+	LiveKitSecret   string
+	PublicIP        netip.Addr
+	PortMin         int
+	PortMax         int
+	SetupTimeout    time.Duration
+	MediaTimeout    time.Duration
+	MaxCallDuration time.Duration
+	ShutdownWindow  time.Duration
 }
 
 func Load() (Config, error) {
 	c := Config{
-		HTTPAddr:       env("HTTP_ADDR", "127.0.0.1:8090"),
-		LiveKitURL:     env("LIVEKIT_URL", "ws://127.0.0.1:7880"),
-		LiveKitAPIKey:  os.Getenv("LIVEKIT_API_KEY"),
-		LiveKitSecret:  os.Getenv("LIVEKIT_API_SECRET"),
-		PortMin:        envInt("MEDIA_PORT_MIN", 40000),
-		PortMax:        envInt("MEDIA_PORT_MAX", 49999),
-		SetupTimeout:   envDuration("SETUP_TIMEOUT", 30*time.Second),
-		MediaTimeout:   envDuration("MEDIA_TIMEOUT", 20*time.Second),
-		ShutdownWindow: envDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
+		HTTPAddr:        env("HTTP_ADDR", "127.0.0.1:8090"),
+		LiveKitURL:      env("LIVEKIT_URL", "ws://127.0.0.1:7880"),
+		LiveKitAPIKey:   os.Getenv("LIVEKIT_API_KEY"),
+		LiveKitSecret:   os.Getenv("LIVEKIT_API_SECRET"),
+		PortMin:         envInt("MEDIA_PORT_MIN", 40000),
+		PortMax:         envInt("MEDIA_PORT_MAX", 49999),
+		SetupTimeout:    envDuration("SETUP_TIMEOUT", 30*time.Second),
+		MediaTimeout:    envDuration("MEDIA_TIMEOUT", 20*time.Second),
+		MaxCallDuration: envDuration("MAX_CALL_DURATION", 2*time.Hour),
+		ShutdownWindow:  envDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
 	}
 	var err error
 	c.PublicIP, err = netip.ParseAddr(os.Getenv("PUBLIC_IP"))

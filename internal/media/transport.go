@@ -279,9 +279,15 @@ func (t *Transport) ReadRTP() (*rtp.Packet, error) {
 	}
 	t.readMu.Unlock()
 	buf := make([]byte, 1600)
+	// The deadline is fixed per call to ReadRTP so packets that fail to parse
+	// cannot keep extending it; only a valid RTP packet resets the window.
+	var deadline time.Time
+	if t.mediaTimeout > 0 {
+		deadline = time.Now().Add(t.mediaTimeout)
+	}
 	for {
-		if t.mediaTimeout > 0 {
-			if err := stream.SetReadDeadline(time.Now().Add(t.mediaTimeout)); err != nil {
+		if !deadline.IsZero() {
+			if err := stream.SetReadDeadline(deadline); err != nil {
 				return nil, err
 			}
 		}

@@ -26,6 +26,9 @@ type Config struct {
 	PublicIP                      netip.Addr
 	PortMin, PortMax              int
 	SetupTimeout, MediaTimeout    time.Duration
+	// MaxCallDuration is a hard cap that ends a connected call even if no
+	// other signal (Meta hang-up, media timeout, LiveKit disconnect) arrives.
+	MaxCallDuration time.Duration
 }
 
 type AcceptParams struct {
@@ -266,7 +269,7 @@ func (m *Manager) runInbound(c *Call, payload uint8) {
 		c.fail(err)
 		return
 	}
-	c.connected(b)
+	c.connected(b, m.conf.MaxCallDuration)
 }
 
 func (m *Manager) connectBridge(c *Call, payload uint8) (*livekitbridge.Bridge, error) {
@@ -312,12 +315,13 @@ func (m *Manager) runOutbound(c *Call) {
 		c.fail(err)
 		return
 	}
-	c.connected(b)
+	c.connected(b, m.conf.MaxCallDuration)
 }
 
-func (c *Call) connected(b *livekitbridge.Bridge) {
+func (c *Call) connected(b *livekitbridge.Bridge, maxDuration time.Duration) {
 	c.signalReady(nil)
 	c.log.Info("WhatsApp call connected")
+	started := time.Now()
 	errCh := make(chan error, 1)
 	go c.observeRTCP()
 	go func() {
@@ -333,15 +337,53 @@ func (c *Call) connected(b *livekitbridge.Bridge) {
 			}
 		}
 	}()
+	reason := c.awaitEnd(b.Done(), errCh, maxDuration)
+	c.log.Info("WhatsApp call ended", "reason", reason, "duration", time.Since(started).Round(time.Second))
+}
+
+// End reasons are logged so a call that lingers can be explained afterwards.
+const (
+	endUserHangup    = "user_hangup"
+	endDisconnected  = "disconnect_requested"
+	endLiveKitClosed = "livekit_disconnected_or_agent_left"
+	endMediaStopped  = "media_stopped"
+	endMaxDuration   = "max_duration"
+)
+
+// awaitEnd blocks until the connected call must stop and returns why. The
+// maximum duration is the last line of defence: a call whose Meta hang-up and
+// media-timeout signals were both lost would otherwise hold its LiveKit
+// participant, UDP sockets and agent session forever. maxDuration <= 0
+// disables the cap.
+func (c *Call) awaitEnd(bridgeDone <-chan struct{}, mediaErr <-chan error, maxDuration time.Duration) string {
+	var capCh <-chan time.Time
+	if maxDuration > 0 {
+		timer := time.NewTimer(maxDuration)
+		defer timer.Stop()
+		capCh = timer.C
+	}
 	select {
 	case <-c.ctx.Done():
-	case <-b.Done():
+		c.mu.Lock()
+		user := c.userTerminated
+		c.mu.Unlock()
+		if user {
+			return endUserHangup
+		}
+		return endDisconnected
+	case <-bridgeDone:
 		c.stopBusiness()
-	case mediaErr := <-errCh:
-		if mediaErr != nil {
-			c.log.Warn("media ended", "error", mediaErr)
+		return endLiveKitClosed
+	case err := <-mediaErr:
+		if err != nil {
+			c.log.Warn("media ended", "error", err)
 		}
 		c.stopBusiness()
+		return endMediaStopped
+	case <-capCh:
+		c.log.Warn("call exceeded maximum duration; terminating", "max_duration", maxDuration)
+		c.stopBusiness()
+		return endMaxDuration
 	}
 }
 
