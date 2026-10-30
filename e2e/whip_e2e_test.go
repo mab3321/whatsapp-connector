@@ -171,9 +171,10 @@ func runCall(t *testing.T, name string, st *stub, agentLeavesAfter time.Duration
 			}
 		}
 		// LiveKit's WHIP endpoint can only send audio from tracks that exist when the
-		// offer arrives, so the worker must publish before the caller joins. Set
-		// E2E_WORKER_PUBLISHES=after_caller to reproduce the current Python worker
-		// (publishes only after wait_for_participant), which this mode cannot serve.
+		// offer arrives. E2E_WORKER_PUBLISHES=after_caller models the direct-media
+		// voice worker: it publishes as soon as it sees the caller JOIN. It must not
+		// wait for the caller to be ACTIVE, which only happens after the answer, and
+		// the answer waits for this track (the deadlock the first live test hit).
 		if os.Getenv("E2E_WORKER_PUBLISHES") == "after_caller" {
 			select {
 			case <-published:
