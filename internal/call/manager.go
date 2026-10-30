@@ -16,6 +16,7 @@ import (
 	"github.com/mab3321/whatsapp-connector/internal/livekitbridge"
 	"github.com/mab3321/whatsapp-connector/internal/media"
 	"github.com/mab3321/whatsapp-connector/internal/meta"
+	"github.com/mab3321/whatsapp-connector/internal/roomapi"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 )
@@ -32,6 +33,14 @@ type Config struct {
 	// zero disables them. StatsInterval is how often media counters are logged;
 	// zero disables the periodic line (the final summary is always logged).
 	RTCPInterval, StatsInterval time.Duration
+	// InboundMode selects how inbound media is handled (ModeRelay or ModeWHIP).
+	InboundMode string
+	// AgentAudioTrack is the name of the agent's published audio track and
+	// AgentWaitTimeout bounds the wait for the agent to join (ModeWHIP).
+	AgentAudioTrack  string
+	AgentWaitTimeout time.Duration
+	// PollInterval is how often a ModeWHIP call checks the room.
+	PollInterval time.Duration
 }
 
 type AcceptParams struct {
@@ -55,6 +64,8 @@ type Manager struct {
 	log      *slog.Logger
 	conf     Config
 	meta     *meta.Client
+	rooms    roomapi.API // ModeWHIP only
+	whip     whipClient  // ModeWHIP only
 	ports    media.PortAllocator
 	mu       sync.Mutex
 	calls    map[string]*Call
@@ -79,10 +90,16 @@ type Call struct {
 	mu                                  sync.Mutex
 	err                                 error
 	terminate, userTerminated, signaled bool
+	whipToken, whipLoc                  string // ModeWHIP: session credentials
 }
 
 func NewManager(log *slog.Logger, conf Config, mc *meta.Client) *Manager {
-	return &Manager{log: log, conf: conf, meta: mc, ports: media.PortAllocator{Min: conf.PortMin, Max: conf.PortMax}, calls: make(map[string]*Call)}
+	m := &Manager{log: log, conf: conf, meta: mc, ports: media.PortAllocator{Min: conf.PortMin, Max: conf.PortMax}, calls: make(map[string]*Call)}
+	if conf.InboundMode == ModeWHIP {
+		m.rooms = NewRoomAPI(conf)
+		m.whip = NewWHIPClient(conf)
+	}
+	return m
 }
 
 func (m *Manager) Accept(ctx context.Context, p AcceptParams) (string, error) {
@@ -102,6 +119,9 @@ func (m *Manager) Accept(ctx context.Context, p AcceptParams) (string, error) {
 		return c.room, nil
 	}
 	m.mu.Unlock()
+	if m.useWHIP(p) {
+		return m.acceptWHIP(ctx, p)
+	}
 	if p.RoomName == "" {
 		p.RoomName = "whatsapp-" + uuid.NewString()
 	}
@@ -239,6 +259,7 @@ func (m *Manager) Connect(ctx context.Context, callID, answer string, wait bool)
 
 func (m *Manager) finish(c *Call) {
 	c.cleanup(m.meta)
+	m.cleanupWHIP(c)
 	m.mu.Lock()
 	delete(m.calls, c.params.CallID)
 	m.mu.Unlock()

@@ -23,6 +23,14 @@ type Config struct {
 	RTCPInterval    time.Duration
 	StatsInterval   time.Duration
 	ShutdownWindow  time.Duration
+
+	// InboundMode is "relay" (default) or "whip"; see internal/call.
+	InboundMode      string
+	AgentAudioTrack  string
+	AgentWaitTimeout time.Duration
+	RoomPollInterval time.Duration
+	// MetaBaseURL overrides the Graph API endpoint (tests and staging only).
+	MetaBaseURL string
 }
 
 func Load() (Config, error) {
@@ -39,6 +47,12 @@ func Load() (Config, error) {
 		RTCPInterval:    envDurationOrOff("RTCP_INTERVAL", 2*time.Second),
 		StatsInterval:   envDurationOrOff("STATS_INTERVAL", 15*time.Second),
 		ShutdownWindow:  envDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
+
+		InboundMode:      env("INBOUND_MODE", "relay"),
+		AgentAudioTrack:  env("AGENT_AUDIO_TRACK_NAME", "roomio_audio"),
+		AgentWaitTimeout: envDuration("AGENT_WAIT_TIMEOUT", 20*time.Second),
+		RoomPollInterval: envDuration("ROOM_POLL_INTERVAL", time.Second),
+		MetaBaseURL:      os.Getenv("META_API_BASE_URL"),
 	}
 	var err error
 	c.PublicIP, err = netip.ParseAddr(os.Getenv("PUBLIC_IP"))
@@ -47,6 +61,9 @@ func Load() (Config, error) {
 	}
 	if c.LiveKitAPIKey == "" || c.LiveKitSecret == "" {
 		return Config{}, errors.New("LIVEKIT_API_KEY and LIVEKIT_API_SECRET are required")
+	}
+	if c.InboundMode != "relay" && c.InboundMode != "whip" {
+		return Config{}, fmt.Errorf("INBOUND_MODE must be relay or whip, got %q", c.InboundMode)
 	}
 	if c.PortMin < 1024 || c.PortMax > 65535 || c.PortMin > c.PortMax {
 		return Config{}, fmt.Errorf("invalid media port range %d-%d", c.PortMin, c.PortMax)

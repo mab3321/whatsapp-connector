@@ -25,12 +25,18 @@ func main() {
 		log.Error("invalid configuration", "error", err)
 		os.Exit(2)
 	}
+	metaClient := meta.New()
+	if conf.MetaBaseURL != "" {
+		metaClient.BaseURL = conf.MetaBaseURL
+	}
 	manager := call.NewManager(log, call.Config{
 		LiveKitURL: conf.LiveKitURL, APIKey: conf.LiveKitAPIKey, APISecret: conf.LiveKitSecret,
 		PublicIP: conf.PublicIP, PortMin: conf.PortMin, PortMax: conf.PortMax,
 		SetupTimeout: conf.SetupTimeout, MediaTimeout: conf.MediaTimeout, MaxCallDuration: conf.MaxCallDuration,
 		RTCPInterval: conf.RTCPInterval, StatsInterval: conf.StatsInterval,
-	}, meta.New())
+		InboundMode: conf.InboundMode, AgentAudioTrack: conf.AgentAudioTrack,
+		AgentWaitTimeout: conf.AgentWaitTimeout, PollInterval: conf.RoomPollInterval,
+	}, metaClient)
 	service := connectorservice.NewService(manager)
 	twirpHandler := livekit.NewConnectorServer(service)
 	mux := http.NewServeMux()
@@ -42,7 +48,7 @@ func main() {
 	mux.Handle("/metrics", promhttp.Handler())
 	server := &http.Server{Addr: conf.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
-		log.Info("WhatsApp connector listening", "address", conf.HTTPAddr, "media_port_min", conf.PortMin, "media_port_max", conf.PortMax)
+		log.Info("WhatsApp connector listening", "address", conf.HTTPAddr, "inbound_mode", conf.InboundMode, "media_port_min", conf.PortMin, "media_port_max", conf.PortMax)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("HTTP server failed", "error", err)
 			os.Exit(1)
