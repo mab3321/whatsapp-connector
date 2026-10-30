@@ -51,6 +51,9 @@ implementation and retains its cancel-safe ICE/DTLS/SRTP teardown.
 
 ## Inbound media modes (`INBOUND_MODE`)
 
+Full write-up (flow, failures found, operations, rollback): `docs/DIRECT_WHATSAPP_MEDIA.md` in
+the `Smart-Convo/SmartConvoAI_Improved` repository.
+
 `relay` (default) terminates Meta's ICE/DTLS-SRTP in the connector and relays
 RTP into the room, as described above. Outbound calls always use this path.
 
