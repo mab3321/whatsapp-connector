@@ -144,3 +144,10 @@ func TestWHIPOutboundUnansweredCallEndsAndCleansUp(t *testing.T) {
 	waitFor(t, "WHIP session delete", func() bool { return w.deletes() == 1 })
 	waitFor(t, "Meta terminate", func() bool { return strings.Contains(strings.Join(ms.list(), ","), "terminate") })
 }
+
+func TestOutboundAttributesMarkDirectionWithoutLosingCallerOnes(t *testing.T) {
+	got := outboundAttributes(map[string]string{"call.human_number": "923001234567"})
+	if got[DirectionAttribute] != DirectionOutbound || got[MediaModeAttribute] != MediaModeDirect || got["call.human_number"] != "923001234567" {
+		t.Fatalf("attributes = %v", got)
+	}
+}

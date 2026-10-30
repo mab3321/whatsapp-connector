@@ -18,6 +18,21 @@ func (m *Manager) useDirectOutbound(p DialParams) bool {
 		(len(p.Agents) > 0 || m.conf.WhipAutoDispatch)
 }
 
+const (
+	// DirectionAttribute tells the voice worker the call was placed by the connector:
+	// the callee has not answered when the participant joins, so the agent must
+	// not speak until the participant is active.
+	DirectionAttribute = "call.media_direction"
+	DirectionOutbound  = "outbound"
+)
+
+// outboundAttributes returns the participant attributes for a placed call.
+func outboundAttributes(in map[string]string) map[string]string {
+	out := directAttributes(in)
+	out[DirectionAttribute] = DirectionOutbound
+	return out
+}
+
 // dialWHIP places an outbound call whose media the LiveKit server terminates.
 // The server creates the offer (Meta only answers), this connector carries it to
 // Meta and brings the answer back; no RTP passes through the connector.
@@ -65,7 +80,7 @@ func (m *Manager) dialWHIP(ctx context.Context, p DialParams) (string, string, e
 	token, err := lkconnector.BuildConnectorToken(lkconnector.ConnectorTokenParams{
 		APIKey: m.conf.APIKey, APISecret: m.conf.APISecret, RoomName: p.RoomName,
 		ParticipantIdentity: p.Identity, ParticipantName: p.Name, ParticipantMetadata: p.Metadata,
-		ParticipantAttributes: directAttributes(p.Attributes), Kind: lkconnector.WHATSAPP,
+		ParticipantAttributes: outboundAttributes(p.Attributes), Kind: lkconnector.WHATSAPP,
 	})
 	if err != nil {
 		directSetups.WithLabelValues("token").Inc()
