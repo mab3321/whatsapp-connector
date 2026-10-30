@@ -34,6 +34,12 @@ type Config struct {
 	// dispatch, relying on the worker's automatic dispatch.
 	WhipAutoDispatch bool
 	RoomPollInterval time.Duration
+	// DirectMediaEnabled selects direct media (INBOUND_MODE=whip) for inbound calls;
+	// DirectMediaPercent limits it to a share of them (canary). WhipTimeout bounds
+	// the WHIP request.
+	DirectMediaEnabled bool
+	DirectMediaPercent int
+	WhipTimeout        time.Duration
 	// MetaBaseURL overrides the Graph API endpoint (tests and staging only).
 	MetaBaseURL string
 }
@@ -60,6 +66,13 @@ func Load() (Config, error) {
 		WhipAutoDispatch: env("WHIP_AUTO_DISPATCH", "false") == "true",
 		RoomPollInterval: envDuration("ROOM_POLL_INTERVAL", time.Second),
 		MetaBaseURL:      os.Getenv("META_API_BASE_URL"),
+
+		DirectMediaEnabled: env("WHATSAPP_DIRECT_MEDIA_ENABLED", "false") == "true",
+		DirectMediaPercent: envInt("WHATSAPP_DIRECT_MEDIA_PERCENT", 100),
+		WhipTimeout:        envDuration("WHIP_REQUEST_TIMEOUT", 12*time.Second),
+	}
+	if c.DirectMediaEnabled {
+		c.InboundMode = "whip"
 	}
 	var err error
 	c.PublicIP, err = netip.ParseAddr(os.Getenv("PUBLIC_IP"))
@@ -74,6 +87,9 @@ func Load() (Config, error) {
 	}
 	if c.AgentTrackWait != "connector" && c.AgentTrackWait != "server" {
 		return Config{}, fmt.Errorf("AGENT_TRACK_WAIT must be connector or server, got %q", c.AgentTrackWait)
+	}
+	if c.DirectMediaPercent < 1 || c.DirectMediaPercent > 100 {
+		return Config{}, fmt.Errorf("WHATSAPP_DIRECT_MEDIA_PERCENT must be 1-100, got %d", c.DirectMediaPercent)
 	}
 	if c.PortMin < 1024 || c.PortMax > 65535 || c.PortMin > c.PortMax {
 		return Config{}, fmt.Errorf("invalid media port range %d-%d", c.PortMin, c.PortMax)

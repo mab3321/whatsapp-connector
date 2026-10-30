@@ -47,6 +47,10 @@ type Config struct {
 	AgentWaitTimeout time.Duration
 	// PollInterval is how often a ModeWHIP call checks the room.
 	PollInterval time.Duration
+	// DirectPercent is the share (1-100) of eligible inbound calls that use
+	// ModeWHIP; zero means all of them. WhipTimeout bounds the WHIP request.
+	DirectPercent int
+	WhipTimeout   time.Duration
 }
 
 type AcceptParams struct {

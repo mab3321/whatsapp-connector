@@ -58,3 +58,25 @@ func TestRTCPAndStatsIntervals(t *testing.T) {
 		t.Fatalf("RTCP_INTERVAL=5s gave %s", c.RTCPInterval)
 	}
 }
+
+func TestDirectMediaFlagSelectsWHIPMode(t *testing.T) {
+	setRequired(t)
+	c, err := Load()
+	if err != nil || c.InboundMode != "relay" || c.DirectMediaEnabled {
+		t.Fatalf("default = %+v, %v", c, err)
+	}
+	t.Setenv("WHATSAPP_DIRECT_MEDIA_ENABLED", "true")
+	t.Setenv("WHATSAPP_DIRECT_MEDIA_PERCENT", "5")
+	c, err = Load()
+	if err != nil || c.InboundMode != "whip" || c.DirectMediaPercent != 5 || c.WhipTimeout != 12*time.Second {
+		t.Fatalf("direct = %+v, %v", c, err)
+	}
+}
+
+func TestDirectMediaPercentMustBeAShare(t *testing.T) {
+	setRequired(t)
+	t.Setenv("WHATSAPP_DIRECT_MEDIA_PERCENT", "150")
+	if _, err := Load(); err == nil {
+		t.Fatal("150% must be rejected")
+	}
+}

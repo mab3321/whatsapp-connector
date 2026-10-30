@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -40,6 +41,14 @@ const (
 	defaultAgentAudioTrack = "roomio_audio"
 	defaultAgentWait       = 20 * time.Second
 	defaultPollInterval    = time.Second
+	// defaultWhipTimeout bounds the WHIP request: the server holds it only until
+	// the agent's track is attached, which takes seconds when the worker publishes
+	// first; a longer wait means the call is already lost.
+	defaultWhipTimeout = 12 * time.Second
+	// MediaModeAttribute tells the voice worker that the SFU terminates the
+	// caller's media, so it must publish its audio before the caller is active.
+	MediaModeAttribute = "call.media_mode"
+	MediaModeDirect    = "direct"
 	// maxMonitorErrors is how many consecutive failed room lookups are tolerated
 	// before the call is treated as lost.
 	maxMonitorErrors = 5
@@ -49,7 +58,25 @@ func (m *Manager) useWHIP(p AcceptParams) bool {
 	// Without any agent dispatch there is no agent to wait for, and the answer
 	// would be sent before any audio track exists. Automatic dispatch (a worker
 	// without an agent name) is opt-in because the connector cannot see it.
-	return m.conf.InboundMode == ModeWHIP && m.rooms != nil && m.whip != nil && (len(p.Agents) > 0 || m.conf.WhipAutoDispatch)
+	if !(m.conf.InboundMode == ModeWHIP && m.rooms != nil && m.whip != nil && (len(p.Agents) > 0 || m.conf.WhipAutoDispatch)) {
+		return false
+	}
+	// Canary: only a share of calls use direct media. The choice is per call and
+	// final; rolling back is a configuration change, not a per-call fallback.
+	if pct := m.conf.DirectPercent; pct > 0 && pct < 100 {
+		return rand.IntN(100) < pct
+	}
+	return true
+}
+
+// directAttributes returns the participant attributes with the media mode set.
+func directAttributes(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in)+1)
+	for k, v := range in {
+		out[k] = v
+	}
+	out[MediaModeAttribute] = MediaModeDirect
+	return out
 }
 
 func (m *Manager) acceptWHIP(ctx context.Context, p AcceptParams) (string, error) {
@@ -108,47 +135,55 @@ func (m *Manager) runWHIP(c *Call) {
 		track = defaultAgentAudioTrack
 	}
 
+	started := time.Now()
 	// 1. The room and its agent must exist before the caller joins, and the
 	// agent's identity must be known so the server can wait for its audio.
 	setupCtx, cancelSetup := context.WithTimeout(c.ctx, agentWait+setup)
 	defer cancelSetup()
 	if err := m.rooms.EnsureRoom(setupCtx, c.room); err != nil {
-		c.fail(fmt.Errorf("create room: %w", err))
+		c.failWHIP("room", fmt.Errorf("create room: %w", err))
 		return
 	}
 	for _, a := range p.Agents {
 		if err := m.rooms.CreateDispatch(setupCtx, c.room, a.AgentName, a.Metadata); err != nil {
-			c.fail(fmt.Errorf("dispatch agent: %w", err))
+			c.failWHIP("dispatch", fmt.Errorf("dispatch agent: %w", err))
 			return
 		}
 	}
 	agentID, err := m.waitForAgent(setupCtx, c.room, track, m.conf.AgentTrackWait != TrackWaitServer, poll, agentWait)
 	if err != nil {
-		c.fail(err)
+		c.failWHIP("agent_not_ready", err)
 		return
 	}
+	directAgentWait.Observe(time.Since(started).Seconds())
 
 	// 2. One offer in, one answer out. The server holds the request until the
 	// agent's audio track is subscribed, so media is complete when it returns.
 	token, err := lkconnector.BuildConnectorToken(lkconnector.ConnectorTokenParams{
 		APIKey: m.conf.APIKey, APISecret: m.conf.APISecret, RoomName: c.room,
 		ParticipantIdentity: c.identity, ParticipantName: p.Name, ParticipantMetadata: p.Metadata,
-		ParticipantAttributes: p.Attributes, Kind: lkconnector.WHATSAPP,
+		ParticipantAttributes: directAttributes(p.Attributes), Kind: lkconnector.WHATSAPP,
 	})
 	if err != nil {
-		c.fail(err)
+		c.failWHIP("token", err)
 		return
 	}
 	c.mu.Lock()
 	c.whipToken = token
 	c.mu.Unlock()
-	whipCtx, cancelWHIP := context.WithTimeout(c.ctx, agentWait+setup)
+	whipTimeout := m.conf.WhipTimeout
+	if whipTimeout <= 0 {
+		whipTimeout = defaultWhipTimeout
+	}
+	whipStarted := time.Now()
+	whipCtx, cancelWHIP := context.WithTimeout(c.ctx, whipTimeout)
 	answer, location, err := m.whip.Create(whipCtx, token, p.SDP, map[string][]string{agentID: {track}})
 	cancelWHIP()
 	if err != nil {
-		c.fail(err)
+		c.failWHIP("whip", err)
 		return
 	}
+	directWHIP.Observe(time.Since(whipStarted).Seconds())
 	c.mu.Lock()
 	c.whipLoc = location
 	c.mu.Unlock()
@@ -157,25 +192,33 @@ func (m *Manager) runWHIP(c *Call) {
 	// 3. Same Meta sequence as the relay path: pre_accept starts media, accept
 	// follows once the media path is up.
 	if err = m.meta.PreAccept(c.ctx, p.APIVersion, p.PhoneID, p.APIToken, p.CallID, answer); err != nil {
-		c.fail(err)
+		c.failWHIP("meta_pre_accept", err)
 		return
 	}
+	directAnswer.Observe(time.Since(started).Seconds())
 	c.mu.Lock()
 	c.signaled = true
 	c.mu.Unlock()
 	if err = m.waitForMedia(c, poll, setup); err != nil {
-		c.fail(err)
+		c.failWHIP("media", err)
 		return
 	}
 	if err = m.meta.Accept(c.ctx, p.APIVersion, p.PhoneID, p.APIToken, p.CallID, answer); err != nil {
-		c.fail(err)
+		c.failWHIP("meta_accept", err)
 		return
 	}
+	directSetups.WithLabelValues("connected").Inc()
 	c.signalReady(nil)
 	c.log.Info("WhatsApp call connected")
-	started := time.Now()
+	connected := time.Now()
 	reason := m.monitorWHIP(c, poll)
-	c.log.Info("WhatsApp call ended", "reason", reason, "duration", time.Since(started).Round(time.Second))
+	c.log.Info("WhatsApp call ended", "reason", reason, "duration", time.Since(connected).Round(time.Second))
+}
+
+// failWHIP records why a direct call could not be set up, then fails it.
+func (c *Call) failWHIP(reason string, err error) {
+	directSetups.WithLabelValues(reason).Inc()
+	c.fail(err)
 }
 
 // waitForAgent returns the identity of an agent whose audio track is already
@@ -314,14 +357,18 @@ func (m *Manager) cleanupWHIP(c *Call) {
 	defer cancel()
 	if loc != "" {
 		if err := m.whip.Delete(ctx, token, loc); err == nil {
+			directCleanups.WithLabelValues("deleted").Inc()
 			return
 		} else {
 			c.log.Warn("WHIP session delete failed", "error", err)
 		}
 	}
 	if err := m.rooms.RemoveParticipant(ctx, c.room, c.identity); err != nil && !strings.Contains(err.Error(), "not_found") {
+		directCleanups.WithLabelValues("failed").Inc()
 		c.log.Warn("could not remove WhatsApp participant", "error", err)
+		return
 	}
+	directCleanups.WithLabelValues("removed").Inc()
 }
 
 func minDuration(a, b time.Duration) time.Duration {

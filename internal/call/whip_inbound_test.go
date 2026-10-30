@@ -2,6 +2,7 @@ package call
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -67,6 +68,8 @@ type fakeWHIP struct {
 	err       error
 	deleted   int
 	onCreate  func()
+	token     string
+	budget    time.Duration // time left on the request context when Create ran
 }
 
 const rawAnswer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" +
@@ -74,9 +77,12 @@ const rawAnswer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" +
 	"a=candidate:2 1 udp 2130706431 172.17.0.1 7882 typ host\r\n" +
 	"a=candidate:3 1 udp 2130706431 54.85.250.8 7882 typ host\r\n"
 
-func (f *fakeWHIP) Create(_ context.Context, token, offer string, sub map[string][]string) (string, string, error) {
+func (f *fakeWHIP) Create(ctx context.Context, token, offer string, sub map[string][]string) (string, string, error) {
 	f.mu.Lock()
-	f.subscribe, f.offer = sub, offer
+	f.subscribe, f.offer, f.token = sub, offer, token
+	if d, ok := ctx.Deadline(); ok {
+		f.budget = time.Until(d)
+	}
 	err := f.err
 	f.mu.Unlock()
 	if err != nil {
@@ -354,6 +360,82 @@ func TestHTTPURL(t *testing.T) {
 	for in, want := range map[string]string{"ws://127.0.0.1:7880": "http://127.0.0.1:7880", "wss://x.example": "https://x.example", "http://h": "http://h"} {
 		if got := httpURL(in); got != want {
 			t.Errorf("httpURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func tokenAttributes(t *testing.T, token string) map[string]string {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatalf("not a JWT: %q", token)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claims struct {
+		Attributes map[string]string `json:"attributes"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		t.Fatal(err)
+	}
+	return claims.Attributes
+}
+
+func TestWHIPInboundTellsTheWorkerThatMediaIsDirect(t *testing.T) {
+	rooms, w, ms := &fakeRooms{}, &fakeWHIP{}, newMetaStub(t)
+	rooms.set(agentInfo())
+	w.onCreate = func() { rooms.set(agentInfo(), callerInfo("wa-1", livekit.ParticipantInfo_ACTIVE)) }
+	m := newWHIPManager(t, rooms, w, ms)
+	p := params()
+	p.Attributes = map[string]string{"call.human_number": "923001234567"}
+
+	if _, err := m.Accept(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+
+	attrs := tokenAttributes(t, w.token)
+	if attrs[MediaModeAttribute] != MediaModeDirect || attrs["call.human_number"] != "923001234567" {
+		t.Fatalf("token attributes = %v", attrs)
+	}
+	if _, leaked := p.Attributes[MediaModeAttribute]; leaked {
+		t.Fatal("the caller's attribute map must not be modified")
+	}
+}
+
+func TestWHIPRequestHasATwelveSecondDeadline(t *testing.T) {
+	rooms, w, ms := &fakeRooms{}, &fakeWHIP{}, newMetaStub(t)
+	rooms.set(agentInfo())
+	w.onCreate = func() { rooms.set(agentInfo(), callerInfo("wa-1", livekit.ParticipantInfo_ACTIVE)) }
+	m := newWHIPManager(t, rooms, w, ms)
+
+	if _, err := m.Accept(context.Background(), params()); err != nil {
+		t.Fatal(err)
+	}
+
+	if w.budget <= 11*time.Second || w.budget > 12*time.Second {
+		t.Fatalf("WHIP request budget = %s, want just under 12s", w.budget)
+	}
+}
+
+func TestDirectMediaCanaryUsesAShareOfCalls(t *testing.T) {
+	rooms, w, ms := &fakeRooms{}, &fakeWHIP{}, newMetaStub(t)
+	m := newWHIPManager(t, rooms, w, ms)
+	m.conf.DirectPercent = 50
+	direct := 0
+	for i := 0; i < 400; i++ {
+		if m.useWHIP(params()) {
+			direct++
+		}
+	}
+	if direct < 100 || direct > 300 {
+		t.Fatalf("%d of 400 calls went direct at 50%%", direct)
+	}
+	m.conf.DirectPercent = 100
+	for i := 0; i < 50; i++ {
+		if !m.useWHIP(params()) {
+			t.Fatal("100% must always use direct media")
 		}
 	}
 }
