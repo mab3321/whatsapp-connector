@@ -22,7 +22,8 @@ const TrackWaitServer = "server"
 // Inbound media modes.
 const (
 	// ModeRelay terminates Meta's media in the connector and relays RTP into the
-	// room as a participant (the original design, still used for outbound).
+	// room as a participant (the original design; outbound uses it unless
+	// DirectOutbound is set).
 	ModeRelay = "relay"
 	// ModeWHIP hands Meta's SDP to the LiveKit server, which terminates the media
 	// itself; the connector only does signalling and watches the call.
@@ -33,6 +34,8 @@ const (
 type whipClient interface {
 	Create(ctx context.Context, token, offer string, subscribe map[string][]string) (answer, location string, err error)
 	Delete(ctx context.Context, token, location string) error
+	CreateServerOffer(ctx context.Context, token string, subscribe map[string][]string) (offer, location string, err error)
+	SendAnswer(ctx context.Context, token, location, answer string) error
 }
 
 var _ whipClient = (*whip.Client)(nil)

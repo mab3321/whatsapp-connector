@@ -40,6 +40,9 @@ type Config struct {
 	DirectMediaEnabled bool
 	DirectMediaPercent int
 	WhipTimeout        time.Duration
+	// DirectOutboundEnabled lets the LiveKit server terminate Meta's media for
+	// outbound calls too (the server creates the offer).
+	DirectOutboundEnabled bool
 	// MetaBaseURL overrides the Graph API endpoint (tests and staging only).
 	MetaBaseURL string
 }
@@ -70,6 +73,8 @@ func Load() (Config, error) {
 		DirectMediaEnabled: env("WHATSAPP_DIRECT_MEDIA_ENABLED", "false") == "true",
 		DirectMediaPercent: envInt("WHATSAPP_DIRECT_MEDIA_PERCENT", 100),
 		WhipTimeout:        envDuration("WHIP_REQUEST_TIMEOUT", 12*time.Second),
+
+		DirectOutboundEnabled: env("WHATSAPP_DIRECT_OUTBOUND_ENABLED", "false") == "true",
 	}
 	if c.DirectMediaEnabled {
 		c.InboundMode = "whip"

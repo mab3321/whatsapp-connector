@@ -51,6 +51,9 @@ type Config struct {
 	// ModeWHIP; zero means all of them. WhipTimeout bounds the WHIP request.
 	DirectPercent int
 	WhipTimeout   time.Duration
+	// DirectOutbound lets the LiveKit server terminate Meta's media for outbound
+	// calls too: the server creates the offer, the connector only carries it.
+	DirectOutbound bool
 }
 
 type AcceptParams struct {
@@ -101,11 +104,15 @@ type Call struct {
 	err                                 error
 	terminate, userTerminated, signaled bool
 	whipToken, whipLoc                  string // ModeWHIP: session credentials
+	// direct marks an outbound call whose media the server terminates;
+	// directAnswer is Meta's answer, kept until it is handed to the server.
+	direct       bool
+	directAnswer string
 }
 
 func NewManager(log *slog.Logger, conf Config, mc *meta.Client) *Manager {
 	m := &Manager{log: log, conf: conf, meta: mc, ports: media.PortAllocator{Min: conf.PortMin, Max: conf.PortMax}, calls: make(map[string]*Call)}
-	if conf.InboundMode == ModeWHIP {
+	if conf.InboundMode == ModeWHIP || conf.DirectOutbound {
 		m.rooms = NewRoomAPI(conf)
 		m.whip = NewWHIPClient(conf)
 	}
@@ -204,6 +211,9 @@ func (m *Manager) Dial(ctx context.Context, p DialParams) (string, string, error
 	if p.Identity == "" {
 		p.Identity = "whatsapp-" + uuid.NewString()
 	}
+	if m.useDirectOutbound(p) {
+		return m.dialWHIP(ctx, p)
+	}
 	udp, err := m.ports.Listen()
 	if err != nil {
 		return "", "", err
@@ -250,6 +260,19 @@ func (m *Manager) Connect(ctx context.Context, callID, answer string, wait bool)
 	m.mu.Unlock()
 	if c == nil || !c.outbound {
 		return errors.New("outbound WhatsApp call not found")
+	}
+	if c.direct {
+		// the server terminates the media: keep the answer for runOutboundWHIP
+		c.mu.Lock()
+		if c.directAnswer == "" {
+			c.directAnswer = answer
+			close(c.answerReady)
+		}
+		c.mu.Unlock()
+		if wait {
+			return c.wait(ctx)
+		}
+		return nil
 	}
 	c.mu.Lock()
 	if c.transport == nil {

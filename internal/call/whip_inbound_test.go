@@ -70,6 +70,9 @@ type fakeWHIP struct {
 	onCreate  func()
 	token     string
 	budget    time.Duration // time left on the request context when Create ran
+	// outbound (server-offer) exchange
+	serverOffers int
+	sentAnswer   string
 }
 
 const rawAnswer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" +
@@ -130,6 +133,10 @@ func newMetaStub(t *testing.T) *metaStub {
 		s.actions = append(s.actions, body.Action)
 		s.answers = append(s.answers, body.Session.SDP)
 		s.mu.Unlock()
+		if body.Action == "connect" {
+			_, _ = w.Write([]byte(`{"calls":[{"id":"wacid.out"}]}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{}`))
 	}))
 	t.Cleanup(s.srv.Close)
