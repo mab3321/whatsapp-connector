@@ -41,7 +41,9 @@ type Config struct {
 	// AgentTrackWait: "connector" waits for the agent's audio track before posting
 	// the offer; "server" posts once the agent has joined and relies on a LiveKit
 	// server that holds the offer until the track is published.
-	AgentTrackWait   string
+	AgentTrackWait string
+	// WhipAutoDispatch uses ModeWHIP for calls with no agent dispatch too.
+	WhipAutoDispatch bool
 	AgentWaitTimeout time.Duration
 	// PollInterval is how often a ModeWHIP call checks the room.
 	PollInterval time.Duration

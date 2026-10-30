@@ -29,7 +29,10 @@ type Config struct {
 	AgentAudioTrack  string
 	AgentWaitTimeout time.Duration
 	// AgentTrackWait is "connector" (default) or "server"; see internal/call.
-	AgentTrackWait   string
+	AgentTrackWait string
+	// WhipAutoDispatch also uses whip mode for calls that carry no agent
+	// dispatch, relying on the worker's automatic dispatch.
+	WhipAutoDispatch bool
 	RoomPollInterval time.Duration
 	// MetaBaseURL overrides the Graph API endpoint (tests and staging only).
 	MetaBaseURL string
@@ -54,6 +57,7 @@ func Load() (Config, error) {
 		AgentAudioTrack:  env("AGENT_AUDIO_TRACK_NAME", "roomio_audio"),
 		AgentWaitTimeout: envDuration("AGENT_WAIT_TIMEOUT", 20*time.Second),
 		AgentTrackWait:   env("AGENT_TRACK_WAIT", "connector"),
+		WhipAutoDispatch: env("WHIP_AUTO_DISPATCH", "false") == "true",
 		RoomPollInterval: envDuration("ROOM_POLL_INTERVAL", time.Second),
 		MetaBaseURL:      os.Getenv("META_API_BASE_URL"),
 	}

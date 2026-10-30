@@ -46,9 +46,10 @@ const (
 )
 
 func (m *Manager) useWHIP(p AcceptParams) bool {
-	// Without an explicit agent dispatch there is no agent to wait for, and the
-	// answer would be sent before any audio track exists.
-	return m.conf.InboundMode == ModeWHIP && m.rooms != nil && m.whip != nil && len(p.Agents) > 0
+	// Without any agent dispatch there is no agent to wait for, and the answer
+	// would be sent before any audio track exists. Automatic dispatch (a worker
+	// without an agent name) is opt-in because the connector cannot see it.
+	return m.conf.InboundMode == ModeWHIP && m.rooms != nil && m.whip != nil && (len(p.Agents) > 0 || m.conf.WhipAutoDispatch)
 }
 
 func (m *Manager) acceptWHIP(ctx context.Context, p AcceptParams) (string, error) {

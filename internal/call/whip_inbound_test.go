@@ -338,6 +338,11 @@ func TestUseWHIPRequiresModeAndAgents(t *testing.T) {
 	if m.useWHIP(p) {
 		t.Fatal("no agents: must fall back to relay")
 	}
+	m.conf.WhipAutoDispatch = true
+	if !m.useWHIP(p) {
+		t.Fatal("auto dispatch opt-in must use WHIP without explicit agents")
+	}
+	m.conf.WhipAutoDispatch = false
 	m.conf.InboundMode = ModeRelay
 	p.Agents = params().Agents
 	if m.useWHIP(p) {
