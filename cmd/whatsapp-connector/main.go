@@ -34,7 +34,7 @@ func main() {
 		PublicIP: conf.PublicIP, PortMin: conf.PortMin, PortMax: conf.PortMax,
 		SetupTimeout: conf.SetupTimeout, MediaTimeout: conf.MediaTimeout, MaxCallDuration: conf.MaxCallDuration,
 		RTCPInterval: conf.RTCPInterval, StatsInterval: conf.StatsInterval,
-		InboundMode: conf.InboundMode, AgentAudioTrack: conf.AgentAudioTrack,
+		InboundMode: conf.InboundMode, AgentAudioTrack: conf.AgentAudioTrack, AgentTrackWait: conf.AgentTrackWait,
 		AgentWaitTimeout: conf.AgentWaitTimeout, PollInterval: conf.RoomPollInterval,
 	}, metaClient)
 	service := connectorservice.NewService(manager)

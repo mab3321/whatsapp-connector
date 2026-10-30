@@ -37,7 +37,11 @@ type Config struct {
 	InboundMode string
 	// AgentAudioTrack is the name of the agent's published audio track and
 	// AgentWaitTimeout bounds the wait for the agent to join (ModeWHIP).
-	AgentAudioTrack  string
+	AgentAudioTrack string
+	// AgentTrackWait: "connector" waits for the agent's audio track before posting
+	// the offer; "server" posts once the agent has joined and relies on a LiveKit
+	// server that holds the offer until the track is published.
+	AgentTrackWait   string
 	AgentWaitTimeout time.Duration
 	// PollInterval is how often a ModeWHIP call checks the room.
 	PollInterval time.Duration

@@ -239,6 +239,25 @@ func TestWHIPInboundAgentWithoutAudioTrackFailsClearly(t *testing.T) {
 	}
 }
 
+func TestWHIPInboundServerWaitPostsOnceAgentJoined(t *testing.T) {
+	rooms, w, ms := &fakeRooms{}, &fakeWHIP{}, newMetaStub(t)
+	silent := agentInfo()
+	silent.Tracks = nil // joined, audio not published yet: a patched server holds the offer for it
+	rooms.set(silent)
+	w.onCreate = func() { rooms.set(agentInfo(), callerInfo("wa-1", livekit.ParticipantInfo_ACTIVE)) }
+	m := newWHIPManager(t, rooms, w, ms)
+	m.conf.AgentTrackWait = TrackWaitServer
+	if _, err := m.Accept(context.Background(), params()); err != nil {
+		t.Fatal(err)
+	}
+	if w.subscribe["agent-1"][0] != "roomio_audio" {
+		t.Fatalf("subscribe = %v", w.subscribe)
+	}
+	if got := strings.Join(ms.list(), ","); got != "pre_accept,accept" {
+		t.Fatalf("Meta actions = %s", got)
+	}
+}
+
 func TestWHIPInboundCreateFailure(t *testing.T) {
 	rooms, w, ms := &fakeRooms{}, &fakeWHIP{err: errors.New("boom")}, newMetaStub(t)
 	rooms.set(agentInfo())

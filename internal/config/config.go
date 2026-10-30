@@ -28,6 +28,8 @@ type Config struct {
 	InboundMode      string
 	AgentAudioTrack  string
 	AgentWaitTimeout time.Duration
+	// AgentTrackWait is "connector" (default) or "server"; see internal/call.
+	AgentTrackWait   string
 	RoomPollInterval time.Duration
 	// MetaBaseURL overrides the Graph API endpoint (tests and staging only).
 	MetaBaseURL string
@@ -51,6 +53,7 @@ func Load() (Config, error) {
 		InboundMode:      env("INBOUND_MODE", "relay"),
 		AgentAudioTrack:  env("AGENT_AUDIO_TRACK_NAME", "roomio_audio"),
 		AgentWaitTimeout: envDuration("AGENT_WAIT_TIMEOUT", 20*time.Second),
+		AgentTrackWait:   env("AGENT_TRACK_WAIT", "connector"),
 		RoomPollInterval: envDuration("ROOM_POLL_INTERVAL", time.Second),
 		MetaBaseURL:      os.Getenv("META_API_BASE_URL"),
 	}
@@ -64,6 +67,9 @@ func Load() (Config, error) {
 	}
 	if c.InboundMode != "relay" && c.InboundMode != "whip" {
 		return Config{}, fmt.Errorf("INBOUND_MODE must be relay or whip, got %q", c.InboundMode)
+	}
+	if c.AgentTrackWait != "connector" && c.AgentTrackWait != "server" {
+		return Config{}, fmt.Errorf("AGENT_TRACK_WAIT must be connector or server, got %q", c.AgentTrackWait)
 	}
 	if c.PortMin < 1024 || c.PortMax > 65535 || c.PortMin > c.PortMax {
 		return Config{}, fmt.Errorf("invalid media port range %d-%d", c.PortMin, c.PortMax)

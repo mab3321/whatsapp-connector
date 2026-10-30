@@ -14,6 +14,10 @@ import (
 	"github.com/mab3321/whatsapp-connector/internal/whip"
 )
 
+// TrackWaitServer makes the connector post the offer as soon as the agent has
+// joined, leaving the wait for its audio track to a patched LiveKit server.
+const TrackWaitServer = "server"
+
 // Inbound media modes.
 const (
 	// ModeRelay terminates Meta's media in the connector and relays RTP into the
@@ -117,7 +121,7 @@ func (m *Manager) runWHIP(c *Call) {
 			return
 		}
 	}
-	agentID, err := m.waitForAgent(setupCtx, c.room, track, poll, agentWait)
+	agentID, err := m.waitForAgent(setupCtx, c.room, track, m.conf.AgentTrackWait != TrackWaitServer, poll, agentWait)
 	if err != nil {
 		c.fail(err)
 		return
@@ -177,7 +181,7 @@ func (m *Manager) runWHIP(c *Call) {
 // published. The WHIP server can only send tracks that exist when the offer
 // arrives (a track published later is never attached and the held request
 // times out), so the offer must not be posted before then.
-func (m *Manager) waitForAgent(ctx context.Context, room, track string, poll, limit time.Duration) (string, error) {
+func (m *Manager) waitForAgent(ctx context.Context, room, track string, needTrack bool, poll, limit time.Duration) (string, error) {
 	deadline := time.NewTimer(limit)
 	defer deadline.Stop()
 	tick := time.NewTicker(minDuration(poll, 250*time.Millisecond))
@@ -191,6 +195,9 @@ func (m *Manager) waitForAgent(ctx context.Context, room, track string, poll, li
 					continue
 				}
 				joined = true
+				if !needTrack {
+					return pi.Identity, nil
+				}
 				for _, t := range pi.Tracks {
 					if t.Type == livekit.TrackType_AUDIO && t.Name == track {
 						return pi.Identity, nil
