@@ -60,17 +60,32 @@ does signalling: it creates the room, dispatches the agent, posts the offer, sen
 Meta `pre_accept`/`accept`, and watches the room for hang-up. Inbound calls with
 no agent dispatch fall back to `relay`.
 
-Requirements and limits, all verified against a LiveKit 1.13.7 server:
+Direct media is enabled with `WHATSAPP_DIRECT_MEDIA_ENABLED=true` (same as
+`INBOUND_MODE=whip`). `WHATSAPP_DIRECT_MEDIA_PERCENT` (1-100, default 100) sends only
+that share of inbound calls down this path while the rest stay on relay; the choice
+is made once per call, and rolling back means setting the flag to false. A direct
+call that fails setup is rejected, it does not fall back to relay.
 
-- The agent's audio track (`AGENT_AUDIO_TRACK_NAME`, default `roomio_audio`) must
-  already be published when the offer is posted. WHIP is a single offer/answer, so
-  a track published afterwards is never attached to the call (even forcing it with
-  `UpdateSubscriptions` delivers no audio). A worker that publishes its audio only
-  after `wait_for_participant()` therefore cannot be served in this mode; the
-  connector fails the call with a clear error after `AGENT_WAIT_TIMEOUT`.
-- Do not rely on the server holding the request for a late track: LiveKit's
-  internal RPC retries the held request every few seconds, and each retry replaces
-  the participant (`DUPLICATE_IDENTITY`), which looks like a hang-up to the agent.
+Requirements and limits:
+
+- The connector adds the participant attribute `call.media_mode=direct`. The voice
+  worker must react to it by publishing its audio track
+  (`AGENT_AUDIO_TRACK_NAME`, default `roomio_audio`) as soon as it sees the caller
+  **join**, before it loads configuration. It must not wait for the caller to be
+  ACTIVE: a WHIP participant only becomes ACTIVE after the SDP answer, and the
+  answer waits for the agent's track. WHIP is a single offer/answer, so a track
+  published afterwards is never attached.
+- The LiveKit server must hold the offer until the agent's track exists
+  (`AGENT_TRACK_WAIT=server`, needs the patched server in `deploy/`), or the
+  connector waits for the track itself (`AGENT_TRACK_WAIT=connector`, stock server).
+- The WHIP request has a deadline (`WHIP_REQUEST_TIMEOUT`, default 12s). LiveKit's
+  internal RPC retries a slow request and each retry replaces the participant
+  (`DUPLICATE_IDENTITY`), so set `psrpc: {max_attempts: 1, timeout: 30s}` in
+  `livekit.yaml`.
+- Prometheus metrics: `whatsapp_direct_setup_total{result}`,
+  `whatsapp_direct_agent_ready_seconds`, `whatsapp_direct_whip_seconds`,
+  `whatsapp_direct_answer_seconds`, `whatsapp_direct_cleanup_total{result}`. Packet
+  and loss counters for direct calls come from the LiveKit server.
 
 `go test -tags e2e ./e2e` runs a full call against a real LiveKit server with a
 Meta stub (see the file header for the environment it needs).

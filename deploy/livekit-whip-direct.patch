@@ -1,0 +1,275 @@
+diff -ruN lk-direct.base/pkg/service/roommanager_service.go lk-direct/pkg/service/roommanager_service.go
+--- lk-direct.base/pkg/service/roommanager_service.go	2026-09-17 08:48:56.000000000 +0000
++++ lk-direct/pkg/service/roommanager_service.go	2026-10-30 11:05:33.059390681 +0000
+@@ -21,6 +21,11 @@
+ 	"github.com/livekit/psrpc"
+ )
+ 
++// whipTrackWait bounds how long a WHIP create holds the client's offer while it
++// waits for the publishers it asked to subscribe to, and for those
++// subscriptions to resolve. A var so tests can shorten it.
++var whipTrackWait = 10 * time.Second
++
+ // whipSessionNotifyInterval is a var (rather than a const) so tests can shorten it.
+ var whipSessionNotifyInterval = 10 * time.Second
+ 
+@@ -75,6 +80,25 @@
+ 		return nil, ErrParticipantNotFound
+ 	}
+ 
++	// A session that never produces an answer must not linger in the room: the
++	// agent would keep seeing a caller that never connects.
++	answered := false
++	defer func() {
++		if !answered {
++			room.RemoveParticipant(pi.Identity, lp.ID(), types.ParticipantCloseReasonJoinFailed)
++		}
++	}()
++
++	// Tracks the client asked for must exist before the offer is handled: the
++	// answer and the subscriptions are built while handling it, and a track
++	// published later cannot be attached to a one-shot session (there is no
++	// renegotiation). Waiting here lets a publisher that only starts once it sees
++	// this participant (a voice agent) still be heard.
++	if err := waitForPublishedTracks(ctx, room, lp, req.SubscribedParticipantTracks, whipTrackWait); err != nil {
++		lp.GetLogger().Warnw("whip service: requested tracks were not published", err)
++		return nil, err
++	}
++
+ 	if err := lp.HandleOffer(&livekit.SessionDescription{
+ 		Type: webrtc.SDPTypeOffer.String(),
+ 		Sdp:  req.OfferSdp,
+@@ -88,7 +112,9 @@
+ 	// NOTE: this is outside the WHIP spec, but added as a convenience for clients doing
+ 	// one-shot signalling (i. e. send an offer and get an answer once) to publish and subscribe to
+ 	// well-known tracks (i. e. remote participant identity and track names are well known)
+-	eg, _ := errgroup.WithContext(ctx)
++	subCtx, cancelSub := context.WithTimeout(ctx, whipTrackWait)
++	defer cancelSub()
++	eg, egCtx := errgroup.WithContext(subCtx)
+ 	for publisherIdentity, trackList := range req.SubscribedParticipantTracks {
+ 		for _, trackName := range trackList.TrackNames {
+ 			eg.Go(func() error {
+@@ -96,7 +122,11 @@
+ 					if lp.IsTrackNameSubscribed(livekit.ParticipantIdentity(publisherIdentity), trackName) {
+ 						return nil
+ 					}
+-					time.Sleep(50 * time.Millisecond)
++					select {
++					case <-egCtx.Done():
++						return egCtx.Err()
++					case <-time.After(50 * time.Millisecond):
++					}
+ 				}
+ 			})
+ 		}
+@@ -118,6 +148,7 @@
+ 		lp.GetLogger().Errorw("whip service: could not get ICE session ID", err)
+ 		return nil, err
+ 	}
++	answered = true
+ 
+ 	if req.FromIngress {
+ 		aliveCtx, cancel := context.WithCancel(context.Background())
+@@ -373,3 +404,62 @@
+ }
+ 
+ // --------------------------------
++
++// trackPublishers resolves participants by identity (satisfied by *rtc.Room).
++type trackPublishers interface {
++	GetParticipant(identity livekit.ParticipantIdentity) types.LocalParticipant
++}
++
++// waitForPublishedTracks blocks until every requested publisher has published
++// every named track. It stops at once when the request is cancelled or the
++// waiting participant is closed, and gives up after timeout.
++func waitForPublishedTracks(
++	ctx context.Context,
++	room trackPublishers,
++	waiter types.LocalParticipant,
++	want map[string]*rpc.WHIPCreateRequest_TrackList,
++	timeout time.Duration,
++) error {
++	if len(want) == 0 {
++		return nil
++	}
++	ctx, cancel := context.WithTimeout(ctx, timeout)
++	defer cancel()
++	ticker := time.NewTicker(50 * time.Millisecond)
++	defer ticker.Stop()
++	for {
++		if allTracksPublished(room, want) {
++			return nil
++		}
++		if waiter.IsClosed() || waiter.IsDisconnected() {
++			return psrpc.NewErrorf(psrpc.Canceled, "participant closed while waiting for tracks")
++		}
++		select {
++		case <-ctx.Done():
++			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
++				return psrpc.NewErrorf(psrpc.DeadlineExceeded, "requested tracks were not published within %s", timeout)
++			}
++			return psrpc.NewErrorf(psrpc.Canceled, "request cancelled while waiting for tracks")
++		case <-ticker.C:
++		}
++	}
++}
++
++func allTracksPublished(room trackPublishers, want map[string]*rpc.WHIPCreateRequest_TrackList) bool {
++	for identity, list := range want {
++		publisher := room.GetParticipant(livekit.ParticipantIdentity(identity))
++		if publisher == nil {
++			return false
++		}
++		published := map[string]bool{}
++		for _, track := range publisher.GetPublishedTracks() {
++			published[track.Name()] = true
++		}
++		for _, name := range list.TrackNames {
++			if !published[name] {
++				return false
++			}
++		}
++	}
++	return true
++}
+diff -ruN lk-direct.base/pkg/service/whip_wait_test.go lk-direct/pkg/service/whip_wait_test.go
+--- lk-direct.base/pkg/service/whip_wait_test.go	1970-01-01 00:00:00.000000000 +0000
++++ lk-direct/pkg/service/whip_wait_test.go	2026-10-30 11:05:33.063736380 +0000
+@@ -0,0 +1,135 @@
++package service
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/livekit/livekit-server/pkg/rtc/types"
++	"github.com/livekit/livekit-server/pkg/rtc/types/typesfakes"
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/rpc"
++	"github.com/livekit/psrpc"
++)
++
++type fakePublishers struct {
++	mu     sync.Mutex
++	tracks map[string][]string
++}
++
++func (f *fakePublishers) publish(identity string, names ...string) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.tracks == nil {
++		f.tracks = map[string][]string{}
++	}
++	f.tracks[identity] = append(f.tracks[identity], names...)
++}
++
++func (f *fakePublishers) GetParticipant(identity livekit.ParticipantIdentity) types.LocalParticipant {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	names, ok := f.tracks[string(identity)]
++	if !ok {
++		return nil
++	}
++	p := &typesfakes.FakeLocalParticipant{}
++	var published []types.MediaTrack
++	for _, n := range names {
++		t := &typesfakes.FakeMediaTrack{}
++		t.NameReturns(n)
++		published = append(published, t)
++	}
++	p.GetPublishedTracksReturns(published)
++	return p
++}
++
++func wantAgentAudio() map[string]*rpc.WHIPCreateRequest_TrackList {
++	return map[string]*rpc.WHIPCreateRequest_TrackList{"agent-1": {TrackNames: []string{"roomio_audio"}}}
++}
++
++func rpcCode(t *testing.T, err error) psrpc.ErrorCode {
++	t.Helper()
++	var perr psrpc.Error
++	require.True(t, errors.As(err, &perr), "want a psrpc error, got %v", err)
++	return perr.Code()
++}
++
++func TestWaitForPublishedTracksReturnsAtOnceWhenTrackExists(t *testing.T) {
++	room := &fakePublishers{}
++	room.publish("agent-1", "roomio_audio")
++	start := time.Now()
++
++	err := waitForPublishedTracks(context.Background(), room, &typesfakes.FakeLocalParticipant{}, wantAgentAudio(), time.Second)
++
++	require.NoError(t, err)
++	require.Less(t, time.Since(start), 40*time.Millisecond)
++}
++
++func TestWaitForPublishedTracksWithNothingRequested(t *testing.T) {
++	err := waitForPublishedTracks(context.Background(), &fakePublishers{}, &typesfakes.FakeLocalParticipant{}, nil, time.Second)
++	require.NoError(t, err)
++}
++
++func TestWaitForPublishedTracksReturnsWhenTrackIsPublishedLater(t *testing.T) {
++	room := &fakePublishers{}
++	go func() {
++		time.Sleep(200 * time.Millisecond)
++		room.publish("agent-1", "roomio_audio")
++	}()
++
++	err := waitForPublishedTracks(context.Background(), room, &typesfakes.FakeLocalParticipant{}, wantAgentAudio(), 2*time.Second)
++
++	require.NoError(t, err)
++}
++
++func TestWaitForPublishedTracksIgnoresOtherTrackNames(t *testing.T) {
++	room := &fakePublishers{}
++	room.publish("agent-1", "some_other_track")
++
++	err := waitForPublishedTracks(context.Background(), room, &typesfakes.FakeLocalParticipant{}, wantAgentAudio(), 150*time.Millisecond)
++
++	require.Error(t, err)
++	require.Equal(t, psrpc.DeadlineExceeded, rpcCode(t, err))
++}
++
++func TestWaitForPublishedTracksTimesOut(t *testing.T) {
++	start := time.Now()
++
++	err := waitForPublishedTracks(context.Background(), &fakePublishers{}, &typesfakes.FakeLocalParticipant{}, wantAgentAudio(), 150*time.Millisecond)
++
++	require.Equal(t, psrpc.DeadlineExceeded, rpcCode(t, err))
++	require.Less(t, time.Since(start), time.Second)
++}
++
++func TestWaitForPublishedTracksStopsWhenRequestIsCancelled(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	go func() {
++		time.Sleep(100 * time.Millisecond)
++		cancel()
++	}()
++	start := time.Now()
++
++	err := waitForPublishedTracks(ctx, &fakePublishers{}, &typesfakes.FakeLocalParticipant{}, wantAgentAudio(), 5*time.Second)
++
++	require.Equal(t, psrpc.Canceled, rpcCode(t, err))
++	require.Less(t, time.Since(start), time.Second)
++}
++
++func TestWaitForPublishedTracksStopsWhenParticipantCloses(t *testing.T) {
++	waiter := &typesfakes.FakeLocalParticipant{}
++	go func() {
++		time.Sleep(100 * time.Millisecond)
++		waiter.IsClosedReturns(true)
++	}()
++	start := time.Now()
++
++	err := waitForPublishedTracks(context.Background(), &fakePublishers{}, waiter, wantAgentAudio(), 5*time.Second)
++
++	require.Equal(t, psrpc.Canceled, rpcCode(t, err))
++	require.Less(t, time.Since(start), time.Second)
++}
