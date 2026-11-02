@@ -3,6 +3,7 @@ package livekitbridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -267,6 +268,7 @@ func (b *Bridge) emit(p *rtp.Packet) error {
 func (b *Bridge) pump(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication) {
 	src := b.hub.AddSource(levelReaderFor(pub.Receiver()))
 	defer src.Close()
+	first := true
 	for {
 		p, _, err := track.ReadRTP()
 		if err != nil {
@@ -274,6 +276,20 @@ func (b *Bridge) pump(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublicati
 				b.log.Warn("LiveKit audio track ended", "error", err)
 			}
 			return
+		}
+		if first {
+			first = false
+			var offered []string
+			if r := pub.Receiver(); r != nil {
+				for _, e := range r.GetParameters().HeaderExtensions {
+					offered = append(offered, fmt.Sprintf("%d=%s", e.ID, e.URI))
+				}
+			}
+			var seen []string
+			for _, id := range p.GetExtensionIDs() {
+				seen = append(seen, fmt.Sprintf("%d:%dB", id, len(p.GetExtension(id))))
+			}
+			b.log.Info("audio track attached", "kind", pub.Kind(), "negotiated_extensions", offered, "packet_extensions", seen, "payload_bytes", len(p.Payload))
 		}
 		src.Push(p)
 	}
