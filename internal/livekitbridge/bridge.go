@@ -284,6 +284,9 @@ func (b *Bridge) SetAttributes(attrs map[string]string) {
 	if b.room != nil {
 		b.room.LocalParticipant.SetAttributes(attrs)
 	}
+	if _, answered := attrs["call.answered"]; answered && b.hub != nil {
+		b.hub.Mark()
+	}
 }
 
 // HubStats reports the mixing hub counters (zero when mixing is off).

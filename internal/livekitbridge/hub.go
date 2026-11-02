@@ -62,6 +62,8 @@ type Hub struct {
 	hold    time.Time // end of the mixing hangover
 	closed  bool
 	episode uint32
+	epoch   time.Time // start of the call for timing logs; moved on pickup
+	spoke   bool      // first speech since epoch has been logged
 
 	outMu  sync.Mutex // serialises everything that reaches Emit and the rebaser
 	rebase rtpRebaser
@@ -77,7 +79,7 @@ func NewHub(conf HubConfig) *Hub {
 	if conf.Log == nil {
 		conf.Log = slog.Default()
 	}
-	h := &Hub{conf: conf, sources: map[*Source]struct{}{}}
+	h := &Hub{conf: conf, sources: map[*Source]struct{}{}, epoch: conf.Now()}
 	h.rebase.now = conf.Now
 	return h
 }
@@ -85,6 +87,14 @@ func NewHub(conf HubConfig) *Hub {
 // Stats returns the cumulative counters.
 func (h *Hub) Stats() HubStats {
 	return HubStats{h.passthrough.Load(), h.mixed.Load(), h.dropped.Load(), h.episodes.Load(), h.codecErrors.Load()}
+}
+
+// Mark restarts the clock used for the "first speech" timing, for example when
+// the callee answers.
+func (h *Hub) Mark() {
+	h.mu.Lock()
+	h.epoch, h.spoke = h.conf.Now(), false
+	h.mu.Unlock()
 }
 
 // Mixing reports whether an overlap is currently being mixed.
@@ -158,6 +168,10 @@ func (s *Source) Push(p *rtp.Packet) {
 	}
 	if s.level.speech(p) {
 		s.lastSpeech = now
+		if !h.spoke {
+			h.spoke = true
+			h.conf.Log.Info("first speech from the room", "after_start_ms", now.Sub(h.epoch).Milliseconds(), "audio_level_ext", s.level.id != 0)
+		}
 	}
 	live := h.liveCountLocked(now)
 
