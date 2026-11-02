@@ -332,14 +332,11 @@ func (m *Manager) runInbound(c *Call, payload uint8) {
 }
 
 func (m *Manager) connectBridge(c *Call, payload uint8) (*livekitbridge.Bridge, error) {
-	attrs := c.params.Attributes
-	if c.outbound {
-		attrs = relayOutboundAttributes(attrs)
-	}
 	return livekitbridge.Connect(c.ctx, c.log, livekitbridge.Config{
 		URL: m.conf.LiveKitURL, APIKey: m.conf.APIKey, APISecret: m.conf.APISecret,
 		RoomName: c.room, Identity: c.identity, Name: c.params.Name, Metadata: c.params.Metadata,
-		Attributes: attrs, Agents: c.params.Agents, PayloadType: payload,
+		Attributes: c.params.Attributes, Agents: c.params.Agents, PayloadType: payload,
+		DeferAudio: c.outbound,
 		WriteToMeta: c.writeToMeta, OnDisconnected: c.stopBusiness,
 		MixAudio: m.conf.MixAudio, Codec: livekitbridge.OpusCodec(),
 	})
@@ -379,8 +376,9 @@ func (m *Manager) runOutbound(c *Call) {
 		c.fail(err)
 		return
 	}
-	// The callee has answered and audio can flow: let the agent greet.
-	b.SetAttributes(map[string]string{AnsweredAttribute: "true"})
+	// The callee has answered and audio can flow: start listening, which also
+	// releases the greeting the agent has already generated.
+	b.ReleaseAudio()
 	c.connected(b, m.conf)
 }
 

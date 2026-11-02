@@ -33,6 +33,12 @@ type Config struct {
 	MixAudio bool
 	// Codec performs the decoding/encoding of an overlap; nil disables mixing.
 	Codec Codec
+	// DeferAudio keeps the bridge from subscribing to the room's audio until
+	// ReleaseAudio is called. An outbound call uses it so the agent can load and
+	// generate its greeting while the phone rings: the agent's audio output holds
+	// the greeting until something subscribes, and the callee hears it in full the
+	// moment the call is answered.
+	DeferAudio bool
 	// EmptyGrace is how long the room may have no audio publisher before the
 	// call ends (MixAudio only). Zero uses a default.
 	EmptyGrace time.Duration
@@ -50,8 +56,9 @@ type Bridge struct {
 	hub         *Hub // set when MixAudio is on
 	presence    *presence
 	roomReady   atomic.Bool
-	outbound    rtpRebaser // LiveKit -> Meta
-	inbound     rtpRebaser // Meta -> LiveKit
+	audioOpen   atomic.Bool // subscribing to remote audio is allowed
+	outbound    rtpRebaser  // LiveKit -> Meta
+	inbound     rtpRebaser  // Meta -> LiveKit
 
 	txPackets, txDropped, txWriteErrors atomic.Uint64
 	rxPackets                           atomic.Uint64
@@ -68,6 +75,7 @@ func (b *Bridge) Stats() Stats {
 
 func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error) {
 	b := &Bridge{log: log, conf: conf, done: make(chan struct{})}
+	b.audioOpen.Store(!conf.DeferAudio)
 	if conf.MixAudio {
 		b.hub = NewHub(HubConfig{Codec: conf.Codec, PayloadType: conf.PayloadType, Emit: b.emit, Log: log})
 		b.presence = newPresence(conf.EmptyGrace, func() {
@@ -102,7 +110,7 @@ func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error
 		},
 		ParticipantCallback: lksdk.ParticipantCallback{
 			OnTrackPublished: func(pub *lksdk.RemoteTrackPublication, _ *lksdk.RemoteParticipant) {
-				if pub.Kind() == lksdk.TrackKindAudio {
+				if pub.Kind() == lksdk.TrackKindAudio && b.audioOpen.Load() {
 					_ = pub.SetSubscribed(true)
 				}
 				b.checkPresence()
@@ -138,7 +146,7 @@ func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error
 	}
 	room := lksdk.NewRoom(cb)
 	if err = room.JoinWithContextAndToken(ctx, conf.URL, token,
-		lksdk.WithAutoSubscribe(true),
+		lksdk.WithAutoSubscribe(!conf.DeferAudio),
 		lksdk.WithExtraAttributes(conf.Attributes),
 		lksdk.WithCodecs([]livekit.Codec{{Mime: webrtc.MimeTypeOpus}}),
 	); err != nil {
@@ -295,13 +303,22 @@ func (b *Bridge) pump(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublicati
 	}
 }
 
-// SetAttributes updates the bridge participant's attributes.
-func (b *Bridge) SetAttributes(attrs map[string]string) {
-	if b.room != nil {
-		b.room.LocalParticipant.SetAttributes(attrs)
-	}
-	if _, answered := attrs["call.answered"]; answered && b.hub != nil {
+// ReleaseAudio starts listening to the room: it subscribes to every audio track
+// that is published now and to those published later. It is a no-op unless the
+// bridge was created with DeferAudio.
+func (b *Bridge) ReleaseAudio() {
+	if b.hub != nil {
 		b.hub.Mark()
+	}
+	if b.audioOpen.Swap(true) || b.room == nil {
+		return
+	}
+	for _, rp := range b.room.GetRemoteParticipants() {
+		for _, pub := range rp.TrackPublications() {
+			if remote, ok := pub.(*lksdk.RemoteTrackPublication); ok && remote.Kind() == lksdk.TrackKindAudio {
+				_ = remote.SetSubscribed(true)
+			}
+		}
 	}
 }
 
