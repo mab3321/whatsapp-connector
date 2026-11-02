@@ -45,20 +45,21 @@ type Config struct {
 }
 
 type Bridge struct {
-	log         *slog.Logger
-	conf        Config
-	room        *lksdk.Room
-	local       *webrtc.TrackLocalStaticRTP
-	done        chan struct{}
-	closeOnce   sync.Once
-	trackMu     sync.Mutex
-	activeTrack string
-	hub         *Hub // set when MixAudio is on
-	presence    *presence
-	roomReady   atomic.Bool
-	audioOpen   atomic.Bool // subscribing to remote audio is allowed
-	outbound    rtpRebaser  // LiveKit -> Meta
-	inbound     rtpRebaser  // Meta -> LiveKit
+	log          *slog.Logger
+	conf         Config
+	room         *lksdk.Room
+	local        *webrtc.TrackLocalStaticRTP
+	done         chan struct{}
+	closeOnce    sync.Once
+	trackMu      sync.Mutex
+	activeTrack  string
+	hub          *Hub // set when MixAudio is on
+	presence     *presence
+	presenceKick chan struct{}
+	roomReady    atomic.Bool
+	audioOpen    atomic.Bool // subscribing to remote audio is allowed
+	outbound     rtpRebaser  // LiveKit -> Meta
+	inbound      rtpRebaser  // Meta -> LiveKit
 
 	txPackets, txDropped, txWriteErrors atomic.Uint64
 	rxPackets                           atomic.Uint64
@@ -78,6 +79,7 @@ func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error
 	b.audioOpen.Store(!conf.DeferAudio)
 	if conf.MixAudio {
 		b.hub = NewHub(HubConfig{Codec: conf.Codec, PayloadType: conf.PayloadType, Emit: b.emit, Log: log})
+		b.presenceKick = make(chan struct{}, 1)
 		b.presence = newPresence(conf.EmptyGrace, func() {
 			b.log.Info("no participant is publishing audio any more; ending the call")
 			b.closeDone()
@@ -93,10 +95,10 @@ func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error
 				go conf.OnDisconnected()
 			}
 		},
-		OnParticipantConnected: func(*lksdk.RemoteParticipant) { b.checkPresence() },
+		OnParticipantConnected: func(*lksdk.RemoteParticipant) { b.kickPresence() },
 		OnParticipantDisconnected: func(participant *lksdk.RemoteParticipant) {
 			if b.presence != nil {
-				b.checkPresence()
+				b.kickPresence()
 				return
 			}
 			if !endsCallOnDeparture(participant.Kind()) {
@@ -113,9 +115,9 @@ func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error
 				if pub.Kind() == lksdk.TrackKindAudio && b.audioOpen.Load() {
 					_ = pub.SetSubscribed(true)
 				}
-				b.checkPresence()
+				b.kickPresence()
 			},
-			OnTrackUnpublished: func(*lksdk.RemoteTrackPublication, *lksdk.RemoteParticipant) { b.checkPresence() },
+			OnTrackUnpublished: func(*lksdk.RemoteTrackPublication, *lksdk.RemoteParticipant) { b.kickPresence() },
 			OnTrackSubscribed: func(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, _ *lksdk.RemoteParticipant) {
 				if !strings.EqualFold(track.Codec().MimeType, webrtc.MimeTypeOpus) {
 					return
@@ -154,7 +156,10 @@ func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error
 	}
 	b.room = room
 	b.roomReady.Store(true)
-	b.checkPresence()
+	if b.presence != nil {
+		go b.presenceLoop()
+		b.kickPresence()
+	}
 	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "whatsapp-audio", "whatsapp")
 	if err != nil {
 		room.Disconnect()
@@ -330,7 +335,32 @@ func (b *Bridge) HubStats() HubStats {
 	return b.hub.Stats()
 }
 
-// checkPresence re-evaluates who is still publishing audio in the room.
+// kickPresence asks for the presence to be re-evaluated. It never touches the
+// room, so it is safe to call from the SDK's callbacks, which run with the
+// room's lock held (GetRemoteParticipants from there would deadlock).
+func (b *Bridge) kickPresence() {
+	if b.presence == nil {
+		return
+	}
+	select {
+	case b.presenceKick <- struct{}{}:
+	default:
+	}
+}
+
+// presenceLoop re-evaluates who is publishing audio whenever it is kicked.
+func (b *Bridge) presenceLoop() {
+	for {
+		select {
+		case <-b.presenceKick:
+			b.checkPresence()
+		case <-b.done:
+			return
+		}
+	}
+}
+
+// checkPresence counts the remote participants publishing audio in the room.
 func (b *Bridge) checkPresence() {
 	if b.presence == nil || !b.roomReady.Load() {
 		return
