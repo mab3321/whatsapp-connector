@@ -37,6 +37,7 @@ func main() {
 		InboundMode: conf.InboundMode, AgentAudioTrack: conf.AgentAudioTrack, AgentTrackWait: conf.AgentTrackWait, WhipAutoDispatch: conf.WhipAutoDispatch,
 		AgentWaitTimeout: conf.AgentWaitTimeout, PollInterval: conf.RoomPollInterval,
 		DirectPercent: conf.DirectMediaPercent, WhipTimeout: conf.WhipTimeout, DirectOutbound: conf.DirectOutboundEnabled,
+		MixAudio: conf.RelayAudioMix != "off",
 	}, metaClient)
 	service := connectorservice.NewService(manager)
 	twirpHandler := livekit.NewConnectorServer(service)

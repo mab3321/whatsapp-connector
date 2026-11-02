@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	lkconnector "github.com/livekit/protocol/connector"
 	"github.com/livekit/protocol/livekit"
@@ -25,6 +26,15 @@ type Config struct {
 	PayloadType                        uint8
 	WriteToMeta                        func(*rtp.Packet) error
 	OnDisconnected                     func()
+	// MixAudio lets several participants be heard at once: a single speaker is
+	// forwarded untouched and only an overlap is decoded, mixed and re-encoded.
+	// Off keeps the earlier behaviour (the first track wins).
+	MixAudio bool
+	// Codec performs the decoding/encoding of an overlap; nil disables mixing.
+	Codec Codec
+	// EmptyGrace is how long the room may have no audio publisher before the
+	// call ends (MixAudio only). Zero uses a default.
+	EmptyGrace time.Duration
 }
 
 type Bridge struct {
@@ -36,6 +46,9 @@ type Bridge struct {
 	closeOnce   sync.Once
 	trackMu     sync.Mutex
 	activeTrack string
+	hub         *Hub // set when MixAudio is on
+	presence    *presence
+	roomReady   atomic.Bool
 	outbound    rtpRebaser // LiveKit -> Meta
 	inbound     rtpRebaser // Meta -> LiveKit
 
@@ -54,6 +67,16 @@ func (b *Bridge) Stats() Stats {
 
 func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error) {
 	b := &Bridge{log: log, conf: conf, done: make(chan struct{})}
+	if conf.MixAudio {
+		b.hub = NewHub(HubConfig{Codec: conf.Codec, PayloadType: conf.PayloadType, Emit: b.emit, Log: log})
+		b.presence = newPresence(conf.EmptyGrace, func() {
+			b.log.Info("no participant is publishing audio any more; ending the call")
+			b.closeDone()
+			if conf.OnDisconnected != nil {
+				go conf.OnDisconnected()
+			}
+		})
+	}
 	cb := &lksdk.RoomCallback{
 		OnDisconnected: func() {
 			b.closeDone()
@@ -61,7 +84,12 @@ func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error
 				go conf.OnDisconnected()
 			}
 		},
+		OnParticipantConnected: func(*lksdk.RemoteParticipant) { b.checkPresence() },
 		OnParticipantDisconnected: func(participant *lksdk.RemoteParticipant) {
+			if b.presence != nil {
+				b.checkPresence()
+				return
+			}
 			if !endsCallOnDeparture(participant.Kind()) {
 				return
 			}
@@ -76,11 +104,18 @@ func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error
 				if pub.Kind() == lksdk.TrackKindAudio {
 					_ = pub.SetSubscribed(true)
 				}
+				b.checkPresence()
 			},
+			OnTrackUnpublished: func(*lksdk.RemoteTrackPublication, *lksdk.RemoteParticipant) { b.checkPresence() },
 			OnTrackSubscribed: func(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, _ *lksdk.RemoteParticipant) {
-				if strings.EqualFold(track.Codec().MimeType, webrtc.MimeTypeOpus) {
-					go b.forwardRemote(track, pub.SID())
+				if !strings.EqualFold(track.Codec().MimeType, webrtc.MimeTypeOpus) {
+					return
 				}
+				if b.hub != nil {
+					go b.pump(track, pub)
+					return
+				}
+				go b.forwardRemote(track, pub.SID())
 			},
 			OnTrackUnsubscribed: func(_ *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, _ *lksdk.RemoteParticipant) {
 				b.trackMu.Lock()
@@ -109,6 +144,8 @@ func Connect(ctx context.Context, log *slog.Logger, conf Config) (*Bridge, error
 		return nil, err
 	}
 	b.room = room
+	b.roomReady.Store(true)
+	b.checkPresence()
 	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "whatsapp-audio", "whatsapp")
 	if err != nil {
 		room.Disconnect()
@@ -202,8 +239,77 @@ func (b *Bridge) Done() <-chan struct{} { return b.done }
 func (b *Bridge) closeDone()            { b.closeOnce.Do(func() { close(b.done) }) }
 func (b *Bridge) Close() error {
 	b.closeDone()
+	if b.hub != nil {
+		b.hub.Close()
+	}
+	if b.presence != nil {
+		b.presence.stop()
+	}
 	if b.room != nil {
 		b.room.Disconnect()
 	}
 	return nil
+}
+
+// emit sends one packet of the merged stream to Meta, counting what happens to it.
+func (b *Bridge) emit(p *rtp.Packet) error {
+	if err := b.conf.WriteToMeta(p); err != nil {
+		if !isFatalWrite(err) {
+			b.countWriteFailure(err)
+		}
+		return err
+	}
+	b.txPackets.Add(1)
+	return nil
+}
+
+// pump feeds one subscribed track into the hub.
+func (b *Bridge) pump(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication) {
+	src := b.hub.AddSource(levelReaderFor(pub.Receiver()))
+	defer src.Close()
+	for {
+		p, _, err := track.ReadRTP()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				b.log.Warn("LiveKit audio track ended", "error", err)
+			}
+			return
+		}
+		src.Push(p)
+	}
+}
+
+// SetAttributes updates the bridge participant's attributes.
+func (b *Bridge) SetAttributes(attrs map[string]string) {
+	if b.room != nil {
+		b.room.LocalParticipant.SetAttributes(attrs)
+	}
+}
+
+// HubStats reports the mixing hub counters (zero when mixing is off).
+func (b *Bridge) HubStats() HubStats {
+	if b.hub == nil {
+		return HubStats{}
+	}
+	return b.hub.Stats()
+}
+
+// checkPresence re-evaluates who is still publishing audio in the room.
+func (b *Bridge) checkPresence() {
+	if b.presence == nil || !b.roomReady.Load() {
+		return
+	}
+	audible := 0
+	for _, rp := range b.room.GetRemoteParticipants() {
+		if rp.Kind() == lksdk.ParticipantEgress {
+			continue
+		}
+		for _, pub := range rp.TrackPublications() {
+			if pub.Kind() == lksdk.TrackKindAudio {
+				audible++
+				break
+			}
+		}
+	}
+	b.presence.update(audible)
 }

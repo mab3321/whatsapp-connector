@@ -54,6 +54,8 @@ type Config struct {
 	// DirectOutbound lets the LiveKit server terminate Meta's media for outbound
 	// calls too: the server creates the offer, the connector only carries it.
 	DirectOutbound bool
+	// MixAudio makes relay calls multi-participant: see livekitbridge.Config.
+	MixAudio bool
 }
 
 type AcceptParams struct {
@@ -330,11 +332,16 @@ func (m *Manager) runInbound(c *Call, payload uint8) {
 }
 
 func (m *Manager) connectBridge(c *Call, payload uint8) (*livekitbridge.Bridge, error) {
+	attrs := c.params.Attributes
+	if c.outbound {
+		attrs = relayOutboundAttributes(attrs)
+	}
 	return livekitbridge.Connect(c.ctx, c.log, livekitbridge.Config{
 		URL: m.conf.LiveKitURL, APIKey: m.conf.APIKey, APISecret: m.conf.APISecret,
 		RoomName: c.room, Identity: c.identity, Name: c.params.Name, Metadata: c.params.Metadata,
-		Attributes: c.params.Attributes, Agents: c.params.Agents, PayloadType: payload,
+		Attributes: attrs, Agents: c.params.Agents, PayloadType: payload,
 		WriteToMeta: c.writeToMeta, OnDisconnected: c.stopBusiness,
+		MixAudio: m.conf.MixAudio, Codec: livekitbridge.OpusCodec(),
 	})
 }
 
@@ -372,6 +379,8 @@ func (m *Manager) runOutbound(c *Call) {
 		c.fail(err)
 		return
 	}
+	// The callee has answered and audio can flow: let the agent greet.
+	b.SetAttributes(map[string]string{AnsweredAttribute: "true"})
 	c.connected(b, m.conf)
 }
 
@@ -410,11 +419,16 @@ func (c *Call) connected(b *livekitbridge.Bridge, conf Config) {
 func (c *Call) statsAttrs(b *livekitbridge.Bridge) []any {
 	ts := c.transport.Stats()
 	bs := b.Stats()
-	return []any{
+	attrs := []any{
 		"rx_packets", ts.RxPackets, "rx_lost", ts.RxLost, "rx_reordered", ts.RxReordered,
 		"rx_dropped", ts.RxDropped, "rx_jitter_ms", int(ts.RxJitterMs + 0.5),
 		"tx_packets", bs.TxPackets, "tx_not_ready_dropped", bs.TxDropped, "tx_write_errors", bs.TxWriteErrors,
 	}
+	if hs := b.HubStats(); hs.Passthrough+hs.Mixed+hs.Dropped > 0 {
+		attrs = append(attrs, "tx_passthrough", hs.Passthrough, "tx_mixed", hs.Mixed,
+			"tx_other_tracks_dropped", hs.Dropped, "mix_episodes", hs.Episodes, "codec_errors", hs.CodecErrors)
+	}
+	return attrs
 }
 
 // logStats periodically logs media counters so a quality complaint can be

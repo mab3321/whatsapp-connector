@@ -151,3 +151,13 @@ func TestOutboundAttributesMarkDirectionWithoutLosingCallerOnes(t *testing.T) {
 		t.Fatalf("attributes = %v", got)
 	}
 }
+
+func TestRelayOutboundAttributesMarkDirectionWithoutClaimingDirectMedia(t *testing.T) {
+	got := relayOutboundAttributes(map[string]string{"call.human_number": "923001234567"})
+	if got[DirectionAttribute] != DirectionOutbound || got["call.human_number"] != "923001234567" {
+		t.Fatalf("attributes = %v", got)
+	}
+	if _, direct := got[MediaModeAttribute]; direct {
+		t.Fatal("a relayed call must not claim direct media")
+	}
+}

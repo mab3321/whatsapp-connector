@@ -33,6 +33,25 @@ func outboundAttributes(in map[string]string) map[string]string {
 	return out
 }
 
+const (
+	// AnsweredAttribute is set to "true" on a relay outbound call's participant
+	// once the callee has answered and the media path is up. The voice worker
+	// holds its greeting until then.
+	AnsweredAttribute = "call.answered"
+)
+
+// relayOutboundAttributes returns the attributes of a relayed outbound call: the
+// caller's own, marked as placed by the connector. Unlike a direct call it does
+// not claim direct media.
+func relayOutboundAttributes(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in)+1)
+	for k, v := range in {
+		out[k] = v
+	}
+	out[DirectionAttribute] = DirectionOutbound
+	return out
+}
+
 // dialWHIP places an outbound call whose media the LiveKit server terminates.
 // The server creates the offer (Meta only answers), this connector carries it to
 // Meta and brings the answer back; no RTP passes through the connector.

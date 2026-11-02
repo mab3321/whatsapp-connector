@@ -43,6 +43,10 @@ type Config struct {
 	// DirectOutboundEnabled lets the LiveKit server terminate Meta's media for
 	// outbound calls too (the server creates the offer).
 	DirectOutboundEnabled bool
+	// RelayAudioMix ("auto", the default, or "off") lets relay calls carry several
+	// participants: one speaker is forwarded untouched and only an overlap is
+	// decoded, mixed and re-encoded. "off" keeps the first-track-wins behaviour.
+	RelayAudioMix string
 	// MetaBaseURL overrides the Graph API endpoint (tests and staging only).
 	MetaBaseURL string
 }
@@ -75,6 +79,7 @@ func Load() (Config, error) {
 		WhipTimeout:        envDuration("WHIP_REQUEST_TIMEOUT", 12*time.Second),
 
 		DirectOutboundEnabled: env("WHATSAPP_DIRECT_OUTBOUND_ENABLED", "false") == "true",
+		RelayAudioMix:         env("RELAY_AUDIO_MIX", "auto"),
 	}
 	if c.DirectMediaEnabled {
 		c.InboundMode = "whip"
@@ -92,6 +97,9 @@ func Load() (Config, error) {
 	}
 	if c.AgentTrackWait != "connector" && c.AgentTrackWait != "server" {
 		return Config{}, fmt.Errorf("AGENT_TRACK_WAIT must be connector or server, got %q", c.AgentTrackWait)
+	}
+	if c.RelayAudioMix != "auto" && c.RelayAudioMix != "off" {
+		return Config{}, fmt.Errorf("RELAY_AUDIO_MIX must be auto or off, got %q", c.RelayAudioMix)
 	}
 	if c.DirectMediaPercent < 1 || c.DirectMediaPercent > 100 {
 		return Config{}, fmt.Errorf("WHATSAPP_DIRECT_MEDIA_PERCENT must be 1-100, got %d", c.DirectMediaPercent)
